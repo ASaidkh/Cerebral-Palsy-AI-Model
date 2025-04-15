@@ -1,0 +1,12 @@
+START,STOP,PATIENT,ENCOUNTER,SYSTEM,CODE,DESCRIPTION,BASE_COST,REASONCODE,REASONDESCRIPTION
+2015-06-23T02:44:50Z,2015-06-23T02:59:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,http://snomed.info/sct,430193006,Medication reconciliation (procedure),292.00,,
+2015-04-27T16:52:26Z,2015-04-27T18:15:32Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,66b4a838-2709-c14a-822f-24486938879f,http://snomed.info/sct,52052004,Rehabilitation therapy (regime/therapy),584.00,6525002,Dependent drug abuse (disorder)
+2015-05-27T18:15:32Z,2015-05-27T19:36:46Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,945d1a6d-2731-fa7b-aa02-bf5ad6e9a508,http://snomed.info/sct,52052004,Rehabilitation therapy (regime/therapy),584.00,6525002,Dependent drug abuse (disorder)
+2016-06-21T02:44:50Z,2016-06-21T02:54:32Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,http://snomed.info/sct,103697008,Patient referral for dental care (procedure),584.00,,
+2015-06-26T19:36:46Z,2015-06-26T20:49:49Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,21df66ce-de35-3c7c-a9a9-2c85d4c761f6,http://snomed.info/sct,52052004,Rehabilitation therapy (regime/therapy),584.00,6525002,Dependent drug abuse (disorder)
+2015-11-08T20:49:49Z,2015-11-08T22:06:00Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,3f964c79-3669-b325-3eeb-08a129630a7b,http://snomed.info/sct,52052004,Rehabilitation therapy (regime/therapy),584.00,6525002,Dependent drug abuse (disorder)
+2015-12-08T22:06:00Z,2015-12-08T23:25:55Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,8e667fa1-f791-6df2-c296-2158f3d5947f,http://snomed.info/sct,52052004,Rehabilitation therapy (regime/therapy),584.00,6525002,Dependent drug abuse (disorder)
+2016-01-07T23:25:55Z,2016-01-08T00:46:22Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,00d31b27-7a21-148d-1a15-6366eb619b64,http://snomed.info/sct,52052004,Rehabilitation therapy (regime/therapy),584.00,6525002,Dependent drug abuse (disorder)
+2016-01-15T03:03:12Z,2016-01-15T03:36:54Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,d0d8e367-032e-e8c5-2c84-497409c8f2df,http://snomed.info/sct,710824005,Assessment of health and social care needs (procedure),584.00,,
+2016-01-15T03:36:54Z,2016-01-15T03:55:43Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,d0d8e367-032e-e8c5-2c84-497409c8f2df,http://snomed.info/sct,762993000,Assessment using Morse Fall Scale (procedure),584.00,,
+2016-01-15T03:55:43Z,2016-01-15T04:09:02Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,d0d8e367-032e-e8c5-2c84-497409c8f2df,http://snomed.info/sct,171207006,Depression screening (procedure),584.00,,

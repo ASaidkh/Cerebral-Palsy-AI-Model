@@ -1,0 +1,40 @@
+DATE,PATIENT,ENCOUNTER,CATEGORY,CODE,DESCRIPTION,VALUE,UNITS,TYPE
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,8302-2,Body Height,80.5,cm,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,72514-3,Pain severity - 0-10 verbal numeric rating [Score] - Reported,3.0,{score},numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,29463-7,Body Weight,10.8,kg,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,77606-2,Weight-for-length Per age and sex,35.1,%,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,8289-1,Head Occipital-frontal circumference Percentile,40.5,%,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,9843-4,Head Occipital-frontal circumference,47.4,cm,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,8462-4,Diastolic Blood Pressure,96.0,mm[Hg],numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,8480-6,Systolic Blood Pressure,140.0,mm[Hg],numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,8867-4,Heart rate,81.0,/min,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,vital-signs,9279-1,Respiratory rate,13.0,/min,numeric
+2015-06-23T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,9b691efd-872e-0883-5e6e-5fb609e83ec3,social-history,72166-2,Tobacco smoking status,Never smoked tobacco (finding),,text
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,8302-2,Body Height,85.8,cm,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,72514-3,Pain severity - 0-10 verbal numeric rating [Score] - Reported,2.0,{score},numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,29463-7,Body Weight,11.7,kg,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,77606-2,Weight-for-length Per age and sex,27.2,%,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,8289-1,Head Occipital-frontal circumference Percentile,40.5,%,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,9843-4,Head Occipital-frontal circumference,48.3,cm,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,8462-4,Diastolic Blood Pressure,94.0,mm[Hg],numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,8480-6,Systolic Blood Pressure,142.0,mm[Hg],numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,8867-4,Heart rate,77.0,/min,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,vital-signs,9279-1,Respiratory rate,13.0,/min,numeric
+2015-12-22T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,58fa60a7-feb0-35a7-5f85-84c327a143bd,social-history,72166-2,Tobacco smoking status,Never smoked tobacco (finding),,text
+2015-06-08T03:03:12Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,4a77f6a9-9cf5-defb-5e4f-a505a9635b1a,vital-signs,8462-4,Diastolic Blood Pressure,101.0,mm[Hg],numeric
+2015-06-08T03:03:12Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,4a77f6a9-9cf5-defb-5e4f-a505a9635b1a,vital-signs,8480-6,Systolic Blood Pressure,143.0,mm[Hg],numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,8302-2,Body Height,89.5,cm,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,72514-3,Pain severity - 0-10 verbal numeric rating [Score] - Reported,1.0,{score},numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,29463-7,Body Weight,12.5,kg,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,77606-2,Weight-for-length Per age and sex,24.6,%,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,8289-1,Head Occipital-frontal circumference Percentile,40.5,%,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,9843-4,Head Occipital-frontal circumference,48.9,cm,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,39156-5,Body mass index (BMI) [Ratio],15.6,kg/m2,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,59576-9,Body mass index (BMI) [Percentile] Per age and sex,27.6,%,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,8462-4,Diastolic Blood Pressure,91.0,mm[Hg],numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,8480-6,Systolic Blood Pressure,144.0,mm[Hg],numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,8867-4,Heart rate,60.0,/min,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,vital-signs,9279-1,Respiratory rate,15.0,/min,numeric
+2016-06-21T02:44:50Z,bcb291d9-1d62-4497-bf52-60cc2b5ad933,c9ec98bd-b64d-ea12-3978-ff74d908a6e6,social-history,72166-2,Tobacco smoking status,Never smoked tobacco (finding),,text
+2016-01-15T03:03:12Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,d0d8e367-032e-e8c5-2c84-497409c8f2df,vital-signs,8302-2,Body Height,187.3,cm,numeric
+2016-01-15T03:03:12Z,5cd1f9a5-3fc0-f097-6774-e00ec6ce276c,d0d8e367-032e-e8c5-2c84-497409c8f2df,vital-signs,72514-3,Pain severity - 0-10 verbal numeric rating [Score] - Reported,2.0,{score},numeric
