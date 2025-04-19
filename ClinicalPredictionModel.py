@@ -4,10 +4,12 @@ import tensorflow as tf
 from tensorflow import keras
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from collections import defaultdict
 import os
 from datetime import datetime, timedelta
+import json
 
 class ClinicalPredictionModel:
     def __init__(self, data_dir):
@@ -69,36 +71,52 @@ class ClinicalPredictionModel:
             except FileNotFoundError:
                 # Not all datasets might be available
                 pass
+                
+            # Print raw date examples before conversion
+            print("\n=== DATE FORMATS BEFORE CONVERSION ===")
+            if not self.patients_df.empty and 'BIRTHDATE' in self.patients_df.columns:
+                print(f"PATIENT BIRTHDATE example: {self.patients_df['BIRTHDATE'].iloc[0]}")
             
-            # Convert date columns to datetime
-            self.patients_df['BIRTHDATE'] = pd.to_datetime(self.patients_df['BIRTHDATE'])
-            self.encounters_df['START'] = pd.to_datetime(self.encounters_df['START'])
-            self.encounters_df['STOP'] = pd.to_datetime(self.encounters_df['STOP'])
-            self.conditions_df['START'] = pd.to_datetime(self.conditions_df['START'])
-            self.conditions_df['STOP'] = pd.to_datetime(self.conditions_df['STOP'])
-            self.observations_df['DATE'] = pd.to_datetime(self.observations_df['DATE'])
-            self.medications_df['START'] = pd.to_datetime(self.medications_df['START'])
-            self.medications_df['STOP'] = pd.to_datetime(self.medications_df['STOP'])
-            self.procedures_df['START'] = pd.to_datetime(self.procedures_df['START'])
+            if not self.encounters_df.empty and 'START' in self.encounters_df.columns:
+                print(f"ENCOUNTER START example: {self.encounters_df['START'].iloc[0]}")
             
-            # Process additional date fields if available
+            # Convert date columns to datetime with consistent timezone handling
+            # Always use utc=True to properly handle timezone-aware dates and convert to UTC
+            print("\n=== CONVERTING DATE COLUMNS TO TIMEZONE-NAIVE ===")
+            
+            # Define a helper function to convert dates to timezone-naive
+            def convert_to_naive(df, date_columns):
+                for col in date_columns:
+                    if col in df.columns:
+                        # First convert to datetime with timezone awareness
+                        df[col] = pd.to_datetime(df[col], utc=True)
+                        # Then strip timezone info to make naive
+                        df[col] = df[col].dt.tz_localize(None)
+                        if not df.empty:
+                            print(f"Converted {col} to timezone-naive. Example: {df[col].iloc[0]}")
+            
+            # Convert all date columns to timezone-naive
+            convert_to_naive(self.patients_df, ['BIRTHDATE'])
+            convert_to_naive(self.encounters_df, ['START', 'STOP'])
+            convert_to_naive(self.conditions_df, ['START', 'STOP'])
+            convert_to_naive(self.observations_df, ['DATE'])
+            convert_to_naive(self.medications_df, ['START', 'STOP'])
+            convert_to_naive(self.procedures_df, ['START'])
+            
             if hasattr(self, 'immunizations_df') and self.immunizations_df is not None:
-                self.immunizations_df['DATE'] = pd.to_datetime(self.immunizations_df['DATE'])
+                convert_to_naive(self.immunizations_df, ['DATE'])
             
             if hasattr(self, 'devices_df') and self.devices_df is not None:
-                self.devices_df['START'] = pd.to_datetime(self.devices_df['START'])
-                self.devices_df['STOP'] = pd.to_datetime(self.devices_df['STOP'])
+                convert_to_naive(self.devices_df, ['START', 'STOP'])
             
             if hasattr(self, 'imaging_studies_df') and self.imaging_studies_df is not None:
-                self.imaging_studies_df['DATE'] = pd.to_datetime(self.imaging_studies_df['DATE'])
+                convert_to_naive(self.imaging_studies_df, ['DATE'])
             
             if hasattr(self, 'allergies_df') and self.allergies_df is not None:
-                self.allergies_df['START'] = pd.to_datetime(self.allergies_df['START'])
-                self.allergies_df['STOP'] = pd.to_datetime(self.allergies_df['STOP'])
+                convert_to_naive(self.allergies_df, ['START', 'STOP'])
             
             if hasattr(self, 'careplans_df') and self.careplans_df is not None:
-                self.careplans_df['START'] = pd.to_datetime(self.careplans_df['START'])
-                self.careplans_df['STOP'] = pd.to_datetime(self.careplans_df['STOP'])
+                convert_to_naive(self.careplans_df, ['START', 'STOP'])
             
             # Initialize target categories
             self._initialize_target_categories()
@@ -569,11 +587,13 @@ class ClinicalPredictionModel:
             features['IMMUNIZATION_COUNT'] = 0
             for category in ['FLU', 'PNEUMOCOCCAL', 'TETANUS', 'OTHER']:
                 features[f'IMM_{category}'] = 0
+
+        print(f"    Found {len(patient_observations)} observations, {len(patient_medications)} medications, {len(patient_conditions)} conditions, {len(patient_procedures)} procedures")
         
         return features
     
     def create_patient_timelines(self, patient_ids, output_dir='patient_data', lookback_months=12, 
-                             batch_size=100, resume=False):
+                            batch_size=100, resume=False):
         """
         Create comprehensive patient timelines with enhanced clinical features
         
@@ -648,31 +668,53 @@ class ClinicalPredictionModel:
         # Process each patient
         for i, patient_id in enumerate(remaining_patients):
             try:
+                print(f"\nProcessing patient: {patient_id} ({i+1}/{len(remaining_patients)})")
+                
                 # Get patient demographics
                 patient_info = self.patients_df[self.patients_df['Id'] == patient_id].iloc[0]
                 
                 # Determine the date range for this patient's records
                 patient_encounters = self.encounters_df[self.encounters_df['PATIENT'] == patient_id]
                 if patient_encounters.empty:
+                    print(f"  No encounters found for patient {patient_id}, skipping")
                     continue  # Skip patients with no encounters
                 
+                # Get date range for patient
                 start_date = patient_encounters['START'].min()
                 end_date = patient_encounters['START'].max()
                 
-                # Create monthly timeline records
-                current_date = start_date.replace(day=1)
-                end_of_month = pd.Timestamp(end_date.year, end_date.month, end_date.days_in_month)
+                print(f"  Patient date range: {start_date} to {end_date}")
+                print(f"  Start date type: {type(start_date)}, tzinfo: {getattr(start_date, 'tzinfo', None)}")
+                print(f"  End date type: {type(end_date)}, tzinfo: {getattr(end_date, 'tzinfo', None)}")
                 
+                # Create monthly timeline records
+                # Make sure to create timezone-naive Timestamp objects
+                current_date = pd.Timestamp(start_date.year, start_date.month, 1)
+                end_of_month = pd.Timestamp(end_date.year, end_date.month, end_date.day)
+                
+                print(f"  Current date: {current_date}, tzinfo: {getattr(current_date, 'tzinfo', None)}")
+                print(f"  End of month: {end_of_month}, tzinfo: {getattr(end_of_month, 'tzinfo', None)}")
+                
+                month_count = 0
                 while current_date <= end_of_month:
-                    # Define the month period
+                    month_count += 1
+                    print(f"  Processing month {month_count}: {current_date}")
+                    
+                    # All date calculations should now produce timezone-naive timestamps
                     next_month = current_date + pd.DateOffset(months=1) - pd.DateOffset(days=1)
-                    
-                    # Define lookback period for features
                     lookback_start = current_date - pd.DateOffset(months=lookback_months)
-                    
-                    # Define prediction period (the next month)
                     prediction_start = next_month + pd.DateOffset(days=1)
                     prediction_end = prediction_start + pd.DateOffset(months=1) - pd.DateOffset(days=1)
+                    
+                    print(f"    Next month end: {next_month}")
+                    print(f"    Lookback start: {lookback_start}")
+                    print(f"    Prediction period: {prediction_start} to {prediction_end}")
+                    
+                    # Verify all timestamps are timezone-naive for debugging
+                    all_naive = all(getattr(ts, 'tzinfo', None) is None 
+                                for ts in [current_date, next_month, lookback_start, 
+                                            prediction_start, prediction_end])
+                    print(f"    All timestamps are timezone-naive: {all_naive}")
                     
                     # Check for emergency visit in the next month
                     emergency_next_month = False
@@ -681,6 +723,8 @@ class ClinicalPredictionModel:
                         (self.encounters_df['START'] >= prediction_start) &
                         (self.encounters_df['START'] <= prediction_end)
                     ]
+                    
+                    print(f"    Found {len(next_month_encounters)} encounters in next month")
                     
                     if not next_month_encounters.empty:
                         # Look for emergency department visits
@@ -691,6 +735,7 @@ class ClinicalPredictionModel:
                             if ('emergency' in description or 'ed' in description or 
                                 'emergency' in encounter_class or 'urgent' in encounter_class):
                                 emergency_next_month = True
+                                print(f"    Emergency visit found in next month")
                                 break
                     
                     # Identify new diagnoses in the next month
@@ -703,6 +748,7 @@ class ClinicalPredictionModel:
                     
                     if not next_month_conditions.empty:
                         new_diagnoses = next_month_conditions['DESCRIPTION'].tolist()
+                        print(f"    Found {len(new_diagnoses)} new diagnoses in next month")
                     
                     # Identify new medications in the next month
                     new_medications = []
@@ -714,6 +760,7 @@ class ClinicalPredictionModel:
                     
                     if not next_month_medications.empty:
                         new_medications = next_month_medications['DESCRIPTION'].tolist()
+                        print(f"    Found {len(new_medications)} new medications in next month")
                     
                     # Identify new procedures in the next month
                     new_procedures = []
@@ -725,8 +772,10 @@ class ClinicalPredictionModel:
                     
                     if not next_month_procedures.empty:
                         new_procedures = next_month_procedures['DESCRIPTION'].tolist()
+                        print(f"    Found {len(new_procedures)} new procedures in next month")
                     
                     # Extract comprehensive clinical features
+                    print("    Extracting clinical features...")
                     clinical_features = self.extract_clinical_features(
                         patient_id, lookback_start, next_month
                     )
@@ -736,7 +785,9 @@ class ClinicalPredictionModel:
                     
                     # Calculate age at this time point
                     if pd.notna(patient_info['BIRTHDATE']):
-                        age_days = (current_date - patient_info['BIRTHDATE']).days
+                        # Ensure birthdate is timezone-naive for comparison
+                        birthdate = patient_info['BIRTHDATE']
+                        age_days = (current_date - birthdate).days
                         demographic_features['AGE_YEARS'] = age_days / 365.25
                     else:
                         demographic_features['AGE_YEARS'] = None
@@ -787,6 +838,7 @@ class ClinicalPredictionModel:
                     
                     # Move to next month
                     current_date = current_date + pd.DateOffset(months=1)
+                    print(f"    Moving to next month: {current_date}")
                 
                 # Save state and batch data periodically
                 processed_patients.append(patient_id)
@@ -812,6 +864,8 @@ class ClinicalPredictionModel:
                     
             except Exception as e:
                 print(f"Error processing patient {patient_id}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         # Create dataframe from all records
@@ -931,7 +985,7 @@ class ClinicalPredictionModel:
                 existing_df = pd.read_csv(latest_file)
                 
                 # Convert date columns back to datetime
-                existing_df['TIME_POINT'] = pd.to_datetime(existing_df['TIME_POINT'])
+                existing_df['TIME_POINT'] = pd.to_datetime(existing_df['TIME_POINT'], format='mixed', errors='coerce')
                 
                 print(f"Loaded {len(existing_df)} existing timeline records for {existing_df['PATIENT_ID'].nunique()} patients")
         
@@ -1524,10 +1578,18 @@ class ClinicalPredictionModel:
             # Get weights from the first layer
             if len(emergency_model.layers) > 1:
                 weights = emergency_model.layers[1].get_weights()[0]
-                bias = emergency_model.layers[1].get_weights()[1]
                 
-                # Calculate feature importance
-                importance = np.abs(weights).mean(axis=1)
+                # Calculate feature importance - Modified to handle different weight shapes
+                # Check the shape of weights and adapt accordingly
+                if len(weights.shape) == 1:
+                    # 1D weights
+                    importance = np.abs(weights)
+                elif len(weights.shape) == 2:
+                    # 2D weights - take mean across appropriate axis
+                    importance = np.abs(weights).mean(axis=1)
+                else:
+                    # For higher dimensions, flatten and take absolute values
+                    importance = np.abs(weights.flatten())
                 
                 # Get feature names
                 feature_names = []
