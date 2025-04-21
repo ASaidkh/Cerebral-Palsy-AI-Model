@@ -636,7 +636,7 @@ class ClinicalPredictionModel:
                 previous_batch = pd.read_csv(last_batch_file)
                 
                 # Convert date columns
-                previous_batch['TIME_POINT'] = pd.to_datetime(previous_batch['TIME_POINT'])
+                previous_batch['TIME_POINT'] = pd.to_datetime(previous_batch['TIME_POINT'], format='mixed', errors='coerce')
                 
                 # Extract data for previous records
                 for _, row in previous_batch.iterrows():
@@ -975,7 +975,7 @@ class ClinicalPredictionModel:
         # Check for existing timeline data
         existing_df = None
         if os.path.exists(output_dir) and not force_new:
-            timeline_files = [f for f in os.listdir(output_dir) if f.startswith('enhanced_patient_timelines_complete_')]
+            timeline_files = [f for f in os.listdir(output_dir) if f.startswith('enhanced_patient_timelines_')]
             if timeline_files:
                 # Sort by timestamp to get most recent
                 timeline_files.sort(reverse=True)
@@ -1070,34 +1070,6 @@ class ClinicalPredictionModel:
         
         return targets
     
-    def _process_additional_patients(self, new_patients, update_patients, existing_df, output_dir, append_new_months=True):
-        """
-        Process new patients and update existing patients
-        
-        Args:
-            new_patients: List of new patient IDs to process
-            update_patients: List of existing patient IDs to update
-            existing_df: DataFrame with existing timeline data
-            output_dir: Directory for timeline data
-            append_new_months: Whether to append new months to existing patients
-            
-        Returns:
-            Tuple of (updated DataFrame, updated targets dictionary)
-        """
-        import pandas as pd
-        import numpy as np
-        from datetime import datetime
-        
-        new_records = []
-        
-        # Target outcomes for new records
-        target_outcomes = {
-            'emergency_visit': [],
-            'diagnoses': [],
-            'medications': [],
-            'procedures': []
-        }
-    
     def calculate_utilization_metrics(self, patient_id, start_date, end_date):
         """
         Calculate healthcare utilization metrics for a patient in a given time period
@@ -1185,8 +1157,19 @@ class ClinicalPredictionModel:
         """
         # Separate features from targets
         X = timeline_df.drop(['PATIENT_ID', 'TIME_POINT', 'HAD_EMERGENCY_NEXT_MONTH', 
-                             'NEW_DIAGNOSES_NEXT_MONTH', 'NEW_MEDICATIONS_NEXT_MONTH', 
-                             'NEW_PROCEDURES_NEXT_MONTH'], axis=1, errors='ignore')
+                            'NEW_DIAGNOSES_NEXT_MONTH', 'NEW_MEDICATIONS_NEXT_MONTH', 
+                            'NEW_PROCEDURES_NEXT_MONTH'], axis=1, errors='ignore')
+        
+        # Convert problematic numeric columns to numeric type with NaN for non-convertible values
+        numeric_prefixes = ['VITAL_', 'COND_', 'MED_', 'PROC_', 'IMG_', 'DEV_', 'ALLERGY_', 
+                            'IMMUNIZATION_', 'IMM_', 'UTIL_']
+        
+        for col in X.columns:
+            if any(col.startswith(prefix) for prefix in numeric_prefixes) or col == 'DEM_AGE_YEARS':
+                try:
+                    X[col] = pd.to_numeric(X[col], errors='coerce')
+                except Exception as e:
+                    print(f"Warning: Could not convert {col} to numeric. Error: {str(e)}")
         
         # Identify categorical and numerical features
         categorical_features = [col for col in X.columns if col.startswith('DEM_') and col not in ['DEM_AGE_YEARS']]
@@ -1310,6 +1293,8 @@ class ClinicalPredictionModel:
         # Prepare features
         print("Preparing features...")
         features = self.prepare_features(timeline_df)
+
+        print("Target Columns:", targets)
         
         X = features['X_processed']
         input_shape = X.shape[1]  # Number of features after processing
@@ -1320,50 +1305,54 @@ class ClinicalPredictionModel:
         print("\nTraining emergency visit prediction model...")
         y_emergency = targets['emergency_visit']
         
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_emergency, test_size=0.2, random_state=42, stratify=y_emergency
-        )
-        
-        # Build and train model
-        emergency_model = self.build_emergency_visit_model(input_shape)
-        
-        class_weight = {0: 1., 1: (y_train.shape[0] - sum(y_train)) / sum(y_train)}
-        print(f"Using class weights: {class_weight}")
-        
-        emergency_history = emergency_model.fit(
-            X_train, y_train,
-            epochs=50,
-            batch_size=32,
-            validation_split=0.2,
-            class_weight=class_weight,
-            callbacks=[
-                keras.callbacks.EarlyStopping(
-                    monitor='val_recall',
-                    patience=10,
-                    restore_best_weights=True
-                )
-            ],
-            verbose=1
-        )
-        
-        # Evaluate model
-        emergency_eval = emergency_model.evaluate(X_test, y_test)
-        emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
-        
-        # Store results
-        results['emergency_visit'] = {
-            'model': emergency_model,
-            'history': emergency_history.history,
-            'metrics': emergency_metrics,
-            'y_test': y_test,
-            'y_pred': emergency_model.predict(X_test)
-        }
-        
-        print(f"Emergency visit model metrics: {emergency_metrics}")
+        # Skip if no emergency visit targets available
+        if len(y_emergency) == 0:
+            print("No emergency visit target data available. Skipping this model.")
+        else:
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y_emergency, test_size=0.2, random_state=42, stratify=y_emergency
+            )
+            
+            # Build and train model
+            emergency_model = self.build_emergency_visit_model(input_shape)
+            
+            class_weight = {0: 1., 1: (y_train.shape[0] - sum(y_train)) / sum(y_train)}
+            print(f"Using class weights: {class_weight}")
+            
+            emergency_history = emergency_model.fit(
+                X_train, y_train,
+                epochs=50,
+                batch_size=32,
+                validation_split=0.2,
+                class_weight=class_weight,
+                callbacks=[
+                    keras.callbacks.EarlyStopping(
+                        monitor='val_recall',
+                        patience=10,
+                        restore_best_weights=True
+                    )
+                ],
+                verbose=1
+            )
+            
+            # Evaluate model
+            emergency_eval = emergency_model.evaluate(X_test, y_test)
+            emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
+            
+            # Store results
+            results['emergency_visit'] = {
+                'model': emergency_model,
+                'history': emergency_history.history,
+                'metrics': emergency_metrics,
+                'y_test': y_test,
+                'y_pred': emergency_model.predict(X_test)
+            }
+            
+            print(f"Emergency visit model metrics: {emergency_metrics}")
         
         # Train diagnosis prediction model
-        if len(self.diagnosis_categories) > 0:
+        if len(self.diagnosis_categories) > 0 and 'diagnoses' in targets and len(targets['diagnoses']) > 0:
             print("\nTraining diagnosis prediction model...")
             y_diagnosis = targets['diagnoses']
             
@@ -1407,9 +1396,11 @@ class ClinicalPredictionModel:
             }
             
             print(f"Diagnosis model metrics: {diagnosis_metrics}")
+        else:
+            print("\nSkipping diagnosis model: no diagnosis categories or target data available")
         
         # Train medication prediction model
-        if len(self.medication_categories) > 0:
+        if len(self.medication_categories) > 0 and 'medications' in targets and len(targets['medications']) > 0:
             print("\nTraining medication prediction model...")
             y_medication = targets['medications']
             
@@ -1453,9 +1444,11 @@ class ClinicalPredictionModel:
             }
             
             print(f"Medication model metrics: {medication_metrics}")
+        else:
+            print("\nSkipping medication model: no medication categories or target data available")
         
         # Train procedure prediction model
-        if len(self.procedure_categories) > 0:
+        if len(self.procedure_categories) > 0 and 'procedures' in targets and len(targets['procedures']) > 0:
             print("\nTraining procedure prediction model...")
             y_procedure = targets['procedures']
             
@@ -1499,6 +1492,8 @@ class ClinicalPredictionModel:
             }
             
             print(f"Procedure model metrics: {procedure_metrics}")
+        else:
+            print("\nSkipping procedure model: no procedure categories or target data available")
         
         # Save feature preprocessor
         self.preprocessors['main'] = features['preprocessor']
@@ -1506,6 +1501,9 @@ class ClinicalPredictionModel:
         # Update models dictionary
         for key, value in results.items():
             self.models[key] = value['model']
+        
+        # Save training history and create plots
+        self.save_training_history(results)
         
         return results
     
@@ -1719,7 +1717,7 @@ class ClinicalPredictionModel:
     
     def _process_additional_patients(self, new_patients, update_patients, existing_df, output_dir, append_new_months=True):
         """
-        Process new patients and update existing patients
+        Process new patients and update existing patients, appending each record to CSV as it's generated
         
         Args:
             new_patients: List of new patient IDs to process
@@ -1734,8 +1732,37 @@ class ClinicalPredictionModel:
         import pandas as pd
         import numpy as np
         from datetime import datetime
+        import os
         
-        new_records = []
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create a timestamp for this run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Define the output CSV file
+        output_csv = os.path.join(output_dir, f'enhanced_patient_timelines_{timestamp}.csv')
+        
+        # Write the header to the CSV file if creating a new file
+        if not os.path.exists(output_csv):
+            # If we have existing data, use its columns
+            if not existing_df.empty:
+                header = existing_df.columns
+            else:
+                # Define a default set of columns - this might need to be expanded based on all possible features
+                header = ['PATIENT_ID', 'TIME_POINT']
+                # Add demographic columns
+                header.extend(['DEM_AGE_YEARS', 'DEM_GENDER', 'DEM_RACE', 'DEM_ETHNICITY'])
+                # Add placeholder for clinical features, utilization features (these will be dynamically expanded)
+                header.extend(['HAD_EMERGENCY_NEXT_MONTH', 'NEW_DIAGNOSES_NEXT_MONTH', 
+                            'NEW_MEDICATIONS_NEXT_MONTH', 'NEW_PROCEDURES_NEXT_MONTH'])
+            
+            # Write header to CSV
+            pd.DataFrame(columns=header).to_csv(output_csv, index=False)
+        
+        # If existing data provided, write it to the CSV first
+        if not existing_df.empty:
+            existing_df.to_csv(output_csv, index=False, mode='w')  # overwrite with existing data
         
         # Target outcomes for new records
         target_outcomes = {
@@ -1744,6 +1771,9 @@ class ClinicalPredictionModel:
             'medications': [],
             'procedures': []
         }
+        
+        # Counter for processed records
+        processed_records = 0
         
         # Process new patients first
         if new_patients:
@@ -1759,17 +1789,21 @@ class ClinicalPredictionModel:
                     patient_encounters = self.encounters_df[self.encounters_df['PATIENT'] == patient_id]
                     
                     if patient_encounters.empty:
+                        print(f"  No encounters found for patient {patient_id}, skipping")
                         continue  # Skip patients with no encounters
                     
                     start_date = patient_encounters['START'].min()
                     end_date = patient_encounters['START'].max()
                     
-                    # Create monthly timeline records (similar to create_patient_timelines)
+                    print(f"  Processing patient {patient_id} ({i+1}/{len(new_patients)}): {start_date} to {end_date}")
+                    
+                    # Create monthly timeline records
                     current_date = start_date.replace(day=1)
                     end_of_month = pd.Timestamp(end_date.year, end_date.month, end_date.days_in_month)
                     
+                    month_records = 0  # Count of records for this patient
+                    
                     while current_date <= end_of_month:
-                        # Implementation similar to create_patient_timelines
                         # Define the month period
                         next_month = current_date + pd.DateOffset(months=1) - pd.DateOffset(days=1)
                         
@@ -1822,6 +1856,7 @@ class ClinicalPredictionModel:
                         if not next_month_medications.empty:
                             new_medications = next_month_medications['DESCRIPTION'].tolist()
                         
+                        # Identify new procedures in the next month
                         new_procedures = []
                         next_month_procedures = self.procedures_df[
                             (self.procedures_df['PATIENT'] == patient_id) &
@@ -1867,12 +1902,20 @@ class ClinicalPredictionModel:
                             **utilization_features,
                             # Target outcomes
                             'HAD_EMERGENCY_NEXT_MONTH': emergency_next_month,
-                            'NEW_DIAGNOSES_NEXT_MONTH': new_diagnoses,
-                            'NEW_MEDICATIONS_NEXT_MONTH': new_medications,
-                            'NEW_PROCEDURES_NEXT_MONTH': new_procedures
+                            'NEW_DIAGNOSES_NEXT_MONTH': str(new_diagnoses),  # Convert list to string for CSV storage
+                            'NEW_MEDICATIONS_NEXT_MONTH': str(new_medications),
+                            'NEW_PROCEDURES_NEXT_MONTH': str(new_procedures)
                         }
                         
-                        new_records.append(record)
+                        # Create a DataFrame for this single record
+                        record_df = pd.DataFrame([record])
+                        
+                        # Append the record to the CSV file
+                        record_df.to_csv(output_csv, mode='a', header=False, index=False)
+                        
+                        # Increment counter
+                        processed_records += 1
+                        month_records += 1
                         
                         # Add to target outcomes
                         target_outcomes['emergency_visit'].append(emergency_next_month)
@@ -1890,49 +1933,217 @@ class ClinicalPredictionModel:
                         # Move to next month
                         current_date = current_date + pd.DateOffset(months=1)
                     
-                    # Progress reporting
                     patients_processed += 1
-                    if patients_processed % 10 == 0:
-                        print(f"Updated {patients_processed}/{len(update_patients)} existing patients")
+                    print(f"    Generated {month_records} timeline records for patient {patient_id}")
+                    
+                    # Progress reporting
+                    if patients_processed % 5 == 0:
+                        print(f"  Processed {patients_processed}/{len(new_patients)} patients, {processed_records} total records")
                         
                 except Exception as e:
-                    print(f"Error updating existing patient {patient_id}: {e}")
+                    print(f"  Error processing patient {patient_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
         
-        # Create DataFrame for new records
-        if new_records:
-            new_df = pd.DataFrame(new_records)
-            print(f"Generated {len(new_records)} new timeline records")
+        # Process update patients (existing patients that need new months added)
+        if update_patients and append_new_months:
+            print(f"\nUpdating {len(update_patients)} existing patients:")
+            update_processed = 0
             
-            # Combine with existing data
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            
-            # Sort by patient and time
-            combined_df = combined_df.sort_values(['PATIENT_ID', 'TIME_POINT'])
-            
-            # Save the updated timeline
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            new_file = os.path.join(output_dir, f'enhanced_patient_timelines_complete_{timestamp}.csv')
-            combined_df.to_csv(new_file, index=False)
-            print(f"Saved combined timeline with {len(combined_df)} records to {new_file}")
-            
-            # Convert targets to numpy arrays
-            targets = {
-                'emergency_visit': np.array(target_outcomes['emergency_visit']),
-                'diagnoses': np.array(target_outcomes['diagnoses']),
-                'medications': np.array(target_outcomes['medications']),
-                'procedures': np.array(target_outcomes['procedures'])
-            }
-            
-            # Merge targets from existing data
-            targets_from_existing = self._extract_targets_from_existing_timeline(existing_df)
-            merged_targets = self._merge_targets(existing_df, new_df, targets_from_existing, targets)
-            
-            return combined_df, merged_targets
-        else:
-            print("No new records generated. Using existing timeline data.")
-            targets = self._extract_targets_from_existing_timeline(existing_df)
-            return existing_df, targets
+            for i, patient_id in enumerate(update_patients):
+                try:
+                    # Similar implementation as for new patients, but only add months past the latest in existing_df
+                    # Get latest existing month for this patient
+                    patient_existing = existing_df[existing_df['PATIENT_ID'] == patient_id]
+                    
+                    if patient_existing.empty:
+                        print(f"  Patient {patient_id} not found in existing data, skipping")
+                        continue
+                    
+                    latest_existing_date = pd.to_datetime(patient_existing['TIME_POINT'], format='mixed', errors='coerce').max()
+                    
+                    # Get patient's data
+                    patient_encounters = self.encounters_df[self.encounters_df['PATIENT'] == patient_id]
+                    
+                    if patient_encounters.empty:
+                        print(f"  No encounters found for patient {patient_id}, skipping")
+                        continue
+                    
+                    # Get patient demographics
+                    patient_info = self.patients_df[self.patients_df['Id'] == patient_id].iloc[0]
+                    
+                    # Find the latest encounter date
+                    latest_encounter_date = patient_encounters['START'].max()
+                    
+                    # Only process if there are newer encounters than what's in the existing data
+                    if latest_encounter_date <= latest_existing_date:
+                        print(f"  No new data for patient {patient_id}, skipping")
+                        continue
+                    
+                    # Start from the month after the latest existing month
+                    start_date = latest_existing_date + pd.DateOffset(months=1)
+                    start_date = start_date.replace(day=1)  # First day of next month
+                    
+                    end_date = latest_encounter_date
+                    
+                    print(f"  Updating patient {patient_id} ({i+1}/{len(update_patients)}): {start_date} to {end_date}")
+                    
+                    # Create monthly timeline records for new months
+                    current_date = start_date
+                    end_of_month = pd.Timestamp(end_date.year, end_date.month, end_date.days_in_month)
+                    
+                    month_records = 0  # Count of records for this patient update
+                    
+                    # Process each month (similar to new patients loop)
+                    while current_date <= end_of_month:
+                        # Same implementation as for new patients
+                        # (Code repeated for each month, generating record and appending to CSV)
+                        # Define the month period
+                        next_month = current_date + pd.DateOffset(months=1) - pd.DateOffset(days=1)
+                        
+                        # Define lookback period for features
+                        lookback_months = 12
+                        lookback_start = current_date - pd.DateOffset(months=lookback_months)
+                        
+                        # Define prediction period
+                        prediction_start = next_month + pd.DateOffset(days=1)
+                        prediction_end = prediction_start + pd.DateOffset(months=1) - pd.DateOffset(days=1)
+                        
+                        # Check for emergency visit in the next month
+                        emergency_next_month = False
+                        next_month_encounters = self.encounters_df[
+                            (self.encounters_df['PATIENT'] == patient_id) &
+                            (self.encounters_df['START'] >= prediction_start) &
+                            (self.encounters_df['START'] <= prediction_end)
+                        ]
+                        
+                        if not next_month_encounters.empty:
+                            # Look for emergency department visits
+                            for _, enc in next_month_encounters.iterrows():
+                                description = str(enc['DESCRIPTION']).lower() if pd.notna(enc['DESCRIPTION']) else ''
+                                encounter_class = str(enc['ENCOUNTERCLASS']).lower() if pd.notna(enc['ENCOUNTERCLASS']) else ''
+                                
+                                if ('emergency' in description or 'ed' in description or 
+                                    'emergency' in encounter_class or 'urgent' in encounter_class):
+                                    emergency_next_month = True
+                                    break
+                        
+                        # Identify new diagnoses, medications, procedures (same as for new patients)
+                        new_diagnoses = []
+                        next_month_conditions = self.conditions_df[
+                            (self.conditions_df['PATIENT'] == patient_id) &
+                            (self.conditions_df['START'] >= prediction_start) &
+                            (self.conditions_df['START'] <= prediction_end)
+                        ]
+                        
+                        if not next_month_conditions.empty:
+                            new_diagnoses = next_month_conditions['DESCRIPTION'].tolist()
+                        
+                        new_medications = []
+                        next_month_medications = self.medications_df[
+                            (self.medications_df['PATIENT'] == patient_id) &
+                            (self.medications_df['START'] >= prediction_start) &
+                            (self.medications_df['START'] <= prediction_end)
+                        ]
+                        
+                        if not next_month_medications.empty:
+                            new_medications = next_month_medications['DESCRIPTION'].tolist()
+                        
+                        new_procedures = []
+                        next_month_procedures = self.procedures_df[
+                            (self.procedures_df['PATIENT'] == patient_id) &
+                            (self.procedures_df['START'] >= prediction_start) &
+                            (self.procedures_df['START'] <= prediction_end)
+                        ]
+                        
+                        if not next_month_procedures.empty:
+                            new_procedures = next_month_procedures['DESCRIPTION'].tolist()
+                        
+                        # Extract features and create record
+                        clinical_features = self.extract_clinical_features(
+                            patient_id, lookback_start, next_month
+                        )
+                        
+                        demographic_features = {}
+                        
+                        if pd.notna(patient_info['BIRTHDATE']):
+                            age_days = (current_date - patient_info['BIRTHDATE']).days
+                            demographic_features['AGE_YEARS'] = age_days / 365.25
+                        else:
+                            demographic_features['AGE_YEARS'] = None
+                        
+                        demographic_features['GENDER'] = patient_info['GENDER'] if pd.notna(patient_info['GENDER']) else 'Unknown'
+                        demographic_features['RACE'] = patient_info['RACE'] if pd.notna(patient_info['RACE']) else 'Unknown'
+                        demographic_features['ETHNICITY'] = patient_info['ETHNICITY'] if pd.notna(patient_info['ETHNICITY']) else 'Unknown'
+                        
+                        utilization_features = self.calculate_utilization_metrics(patient_id, lookback_start, next_month)
+                        
+                        record = {
+                            'PATIENT_ID': patient_id,
+                            'TIME_POINT': current_date,
+                            **{f'DEM_{k}': v for k, v in demographic_features.items()},
+                            **clinical_features,
+                            **utilization_features,
+                            'HAD_EMERGENCY_NEXT_MONTH': emergency_next_month,
+                            'NEW_DIAGNOSES_NEXT_MONTH': str(new_diagnoses),
+                            'NEW_MEDICATIONS_NEXT_MONTH': str(new_medications),
+                            'NEW_PROCEDURES_NEXT_MONTH': str(new_procedures)
+                        }
+                        
+                        # Create a DataFrame for this single record
+                        record_df = pd.DataFrame([record])
+                        
+                        # Append the record to the CSV file
+                        record_df.to_csv(output_csv, mode='a', header=False, index=False)
+                        
+                        # Increment counter
+                        processed_records += 1
+                        month_records += 1
+                        
+                        # Add to target outcomes
+                        target_outcomes['emergency_visit'].append(emergency_next_month)
+                        
+                        # Multi-hot encoding for diagnoses, medications, procedures
+                        diagnosis_target = [1 if dx in new_diagnoses else 0 for dx in self.diagnosis_categories]
+                        target_outcomes['diagnoses'].append(diagnosis_target)
+                        
+                        medication_target = [1 if med in new_medications else 0 for med in self.medication_categories]
+                        target_outcomes['medications'].append(medication_target)
+                        
+                        procedure_target = [1 if proc in new_procedures else 0 for proc in self.procedure_categories]
+                        target_outcomes['procedures'].append(procedure_target)
+                        
+                        # Move to next month
+                        current_date = current_date + pd.DateOffset(months=1)
+                    
+                    update_processed += 1
+                    print(f"    Generated {month_records} new timeline records for patient {patient_id}")
+                    
+                    # Progress reporting
+                    if update_processed % 5 == 0:
+                        print(f"  Updated {update_processed}/{len(update_patients)} patients, {processed_records} total new records")
+                    
+                except Exception as e:
+                    print(f"  Error updating existing patient {patient_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
+        # Now load the complete CSV to return as a DataFrame
+        print(f"\nLoading complete timeline from {output_csv}")
+        combined_df = pd.read_csv(output_csv)
+
+        
+        combined_df['TIME_POINT'] = pd.to_datetime(combined_df['TIME_POINT'], format='mixed', errors='coerce')
+        
+        # Convert targets to numpy arrays
+        targets = self._extract_targets_from_existing_timeline(combined__df)
+        
+        print(f"Processed {processed_records} new records. Total timeline now has {len(combined_df)} records.")
+        
+        return combined_df, targets
+        
     
     def _merge_targets(self, existing_df, new_df, existing_targets, new_targets):
         """
@@ -2001,7 +2212,7 @@ class ClinicalPredictionModel:
             force_new=force_new_timelines,
             append_new_months=append_new_months
         )
-        
+        print("Target Columns (from run pipeline):\n", targets)
         if len(timeline_df) == 0:
             print("No timeline data generated. Exiting.")
             return False
@@ -2383,3 +2594,285 @@ class ClinicalPredictionModel:
                 predictions[patient_id] = patient_predictions
         
         return predictions
+    
+    def save_training_history(self, results, output_dir='metrics'):
+        """
+        Save training history metrics to CSV files and create visualization plots
+        
+        Args:
+            results: Dictionary with model results
+            output_dir: Directory to save metrics and plots
+        """
+        import os
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from datetime import datetime
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Loop through each model type
+        for model_type, result in results.items():
+            if 'history' not in result:
+                print(f"No training history found for {model_type} model. Skipping.")
+                continue
+            
+            # Get training history
+            history = result['history']
+            
+            # Create DataFrame from history
+            history_df = pd.DataFrame(history)
+            
+            # Add epoch column
+            history_df['epoch'] = range(1, len(history_df) + 1)
+            
+            # Save history to CSV
+            history_path = os.path.join(output_dir, f'{model_type}_training_history_{timestamp}.csv')
+            history_df.to_csv(history_path, index=False)
+            print(f"Saved {model_type} training history to {history_path}")
+            
+            # Create plots directory
+            plots_dir = os.path.join(output_dir, 'plots')
+            os.makedirs(plots_dir, exist_ok=True)
+            
+            # Create plots for different metrics
+            
+            # 1. Loss plot
+            plt.figure(figsize=(10, 6))
+            plt.plot(history_df['epoch'], history_df['loss'], label='Training Loss')
+            if 'val_loss' in history_df.columns:
+                plt.plot(history_df['epoch'], history_df['val_loss'], label='Validation Loss')
+            plt.title(f'{model_type.replace("_", " ").title()} Model: Loss Over Epochs')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.7)
+            loss_plot_path = os.path.join(plots_dir, f'{model_type}_loss_{timestamp}.png')
+            plt.savefig(loss_plot_path)
+            plt.close()
+            
+            # 2. Accuracy plot
+            if 'accuracy' in history_df.columns:
+                plt.figure(figsize=(10, 6))
+                plt.plot(history_df['epoch'], history_df['accuracy'], label='Training Accuracy')
+                if 'val_accuracy' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['val_accuracy'], label='Validation Accuracy')
+                plt.title(f'{model_type.replace("_", " ").title()} Model: Accuracy Over Epochs')
+                plt.xlabel('Epoch')
+                plt.ylabel('Accuracy')
+                plt.legend()
+                plt.grid(True, linestyle='--', alpha=0.7)
+                acc_plot_path = os.path.join(plots_dir, f'{model_type}_accuracy_{timestamp}.png')
+                plt.savefig(acc_plot_path)
+                plt.close()
+            
+            # 3. AUC plot
+            if 'auc' in history_df.columns:
+                plt.figure(figsize=(10, 6))
+                plt.plot(history_df['epoch'], history_df['auc'], label='Training AUC')
+                if 'val_auc' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['val_auc'], label='Validation AUC')
+                plt.title(f'{model_type.replace("_", " ").title()} Model: AUC Over Epochs')
+                plt.xlabel('Epoch')
+                plt.ylabel('AUC')
+                plt.legend()
+                plt.grid(True, linestyle='--', alpha=0.7)
+                auc_plot_path = os.path.join(plots_dir, f'{model_type}_auc_{timestamp}.png')
+                plt.savefig(auc_plot_path)
+                plt.close()
+            
+            # 4. Precision plot
+            if 'precision' in history_df.columns:
+                plt.figure(figsize=(10, 6))
+                plt.plot(history_df['epoch'], history_df['precision'], label='Training Precision')
+                if 'val_precision' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['val_precision'], label='Validation Precision')
+                plt.title(f'{model_type.replace("_", " ").title()} Model: Precision Over Epochs')
+                plt.xlabel('Epoch')
+                plt.ylabel('Precision')
+                plt.legend()
+                plt.grid(True, linestyle='--', alpha=0.7)
+                precision_plot_path = os.path.join(plots_dir, f'{model_type}_precision_{timestamp}.png')
+                plt.savefig(precision_plot_path)
+                plt.close()
+            
+            # 5. Recall plot
+            if 'recall' in history_df.columns:
+                plt.figure(figsize=(10, 6))
+                plt.plot(history_df['epoch'], history_df['recall'], label='Training Recall')
+                if 'val_recall' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['val_recall'], label='Validation Recall')
+                plt.title(f'{model_type.replace("_", " ").title()} Model: Recall Over Epochs')
+                plt.xlabel('Epoch')
+                plt.ylabel('Recall')
+                plt.legend()
+                plt.grid(True, linestyle='--', alpha=0.7)
+                recall_plot_path = os.path.join(plots_dir, f'{model_type}_recall_{timestamp}.png')
+                plt.savefig(recall_plot_path)
+                plt.close()
+            
+            # 6. Combined metrics plot
+            if any(metric in history_df.columns for metric in ['accuracy', 'auc', 'precision', 'recall']):
+                plt.figure(figsize=(12, 8))
+                metrics_to_plot = []
+                
+                if 'accuracy' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['accuracy'], label='Accuracy')
+                    metrics_to_plot.append('accuracy')
+                
+                if 'auc' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['auc'], label='AUC')
+                    metrics_to_plot.append('auc')
+                
+                if 'precision' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['precision'], label='Precision')
+                    metrics_to_plot.append('precision')
+                
+                if 'recall' in history_df.columns:
+                    plt.plot(history_df['epoch'], history_df['recall'], label='Recall')
+                    metrics_to_plot.append('recall')
+                
+                plt.title(f'{model_type.replace("_", " ").title()} Model: Performance Metrics')
+                plt.xlabel('Epoch')
+                plt.ylabel('Metric Value')
+                plt.legend()
+                plt.grid(True, linestyle='--', alpha=0.7)
+                combined_plot_path = os.path.join(plots_dir, f'{model_type}_combined_metrics_{timestamp}.png')
+                plt.savefig(combined_plot_path)
+                plt.close()
+        
+            # Create final evaluation metrics comparison
+            self._create_model_comparison_plots(results, plots_dir, timestamp)
+            
+            print(f"Created and saved metric plots in {plots_dir}")
+
+
+    def _create_model_comparison_plots(self, results, plots_dir, timestamp):
+        """
+        Create plots comparing final evaluation metrics across models
+        
+        Args:
+            results: Dictionary with model results
+            plots_dir: Directory to save plots
+            timestamp: Timestamp string for file naming
+        """
+        import matplotlib.pyplot as plt
+        import pandas as pd
+        import seaborn as sns
+        import numpy as np
+        
+        # Extract final evaluation metrics for each model
+        metrics_data = []
+        
+        for model_type, result in results.items():
+            if 'metrics' in result:
+                model_metrics = result['metrics']
+                model_row = {'model_type': model_type.replace('_', ' ').title()}
+                
+                for metric_name, metric_value in model_metrics.items():
+                    model_row[metric_name] = metric_value
+                
+                metrics_data.append(model_row)
+        
+        if not metrics_data:
+            print("No evaluation metrics found for comparison plots.")
+            return
+        
+        # Create DataFrame with metrics
+        metrics_df = pd.DataFrame(metrics_data)
+        
+        # List of metrics to compare (if present in the data)
+        metrics_to_compare = ['accuracy', 'loss', 'auc', 'precision', 'recall']
+        available_metrics = [m for m in metrics_to_compare if m in metrics_df.columns]
+        
+        if not available_metrics:
+            print("No common metrics found for comparison plots.")
+            return
+        
+        # Create comparison bar chart for each metric
+        for metric in available_metrics:
+            plt.figure(figsize=(10, 6))
+            ax = sns.barplot(x='model_type', y=metric, data=metrics_df)
+            
+            # Add value labels on top of bars
+            for i, bar in enumerate(ax.patches):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.01,
+                    f'{bar.get_height():.4f}',
+                    ha='center',
+                    fontsize=10
+                )
+            
+            plt.title(f'Comparison of {metric.title()} Across Models')
+            plt.xlabel('Model Type')
+            plt.ylabel(metric.title())
+            plt.grid(True, linestyle='--', alpha=0.3, axis='y')
+            plt.tight_layout()
+            
+            # Save the plot
+            comparison_path = os.path.join(plots_dir, f'model_comparison_{metric}_{timestamp}.png')
+            plt.savefig(comparison_path)
+            plt.close()
+        
+        # Create radar chart for model comparison if we have multiple metrics
+        if len(available_metrics) >= 3 and len(metrics_df) >= 2:
+            self._create_radar_chart_comparison(metrics_df, available_metrics, plots_dir, timestamp)
+
+
+    def _create_radar_chart_comparison(self, metrics_df, available_metrics, plots_dir, timestamp):
+        """
+        Create a radar chart comparing models across multiple metrics
+        
+        Args:
+            metrics_df: DataFrame with model metrics
+            available_metrics: List of metrics to include in the chart
+            plots_dir: Directory to save plots
+            timestamp: Timestamp string for file naming
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+        
+        # Number of metrics to plot
+        N = len(available_metrics)
+        
+        # Create figure
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, polar=True)
+        
+        # Angle for each metric (evenly spaced)
+        angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+        
+        # Close the loop
+        angles += angles[:1]
+        
+        # For each model, add a line to the radar chart
+        for i, (index, row) in enumerate(metrics_df.iterrows()):
+            # Get values for this model
+            values = [row[metric] for metric in available_metrics]
+            
+            # Close the loop
+            values += values[:1]
+            
+            # Plot the line
+            ax.plot(angles, values, linewidth=2, label=row['model_type'])
+            
+            # Fill the area
+            ax.fill(angles, values, alpha=0.1)
+        
+        # Set category labels
+        plt.xticks(angles[:-1], [metric.title() for metric in available_metrics])
+        
+        # Add legend
+        plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+        
+        plt.title('Radar Chart: Model Performance Comparison', size=15, y=1.1)
+        
+        # Save the radar chart
+        radar_path = os.path.join(plots_dir, f'model_comparison_radar_{timestamp}.png')
+        plt.savefig(radar_path, bbox_inches='tight')
+        plt.close()
