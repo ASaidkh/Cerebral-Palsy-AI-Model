@@ -133,13 +133,27 @@ class ClinicalPredictionModel:
     
     def _initialize_target_categories(self):
         """Initialize target categories for multi-label prediction"""
-        # For diagnosis prediction - identify top conditions
+        # For diagnosis prediction - identify top conditions, excluding findings and medication reviews
         if not self.conditions_df.empty:
-            condition_counts = self.conditions_df['DESCRIPTION'].value_counts().reset_index()
+            # Filter out conditions that contain "finding" or "Medication review"
+            filtered_conditions = self.conditions_df[
+                ~self.conditions_df['DESCRIPTION'].str.contains(
+                    r"\(finding|\(disorder|Medication review", 
+                    case=False, 
+                    na=False, 
+                    regex=True
+                )
+            ]
+            
+            # Get value counts of the filtered conditions
+            condition_counts = filtered_conditions['DESCRIPTION'].value_counts().reset_index()
             condition_counts.columns = ['condition', 'count']
+            
             # Take top 20 conditions or all if less than 20
             top_n = min(20, len(condition_counts))
             self.diagnosis_categories = condition_counts.head(top_n)['condition'].tolist()
+            
+            print(f"Selected {len(self.diagnosis_categories)} diagnosis categories after filtering")
         
         # For medication prediction - identify top medications
         if not self.medications_df.empty:
@@ -1208,24 +1222,20 @@ class ClinicalPredictionModel:
         }
     
     def build_emergency_visit_model(self, input_shape):
-        """
-        Build neural network model for emergency visit prediction
-        
-        Args:
-            input_shape: Shape of input features
-            
-        Returns:
-            Compiled TensorFlow model
-        """
         model = keras.Sequential([
             keras.layers.Input(shape=(input_shape,)),
-            keras.layers.Dense(256, activation='relu'),
+            # Wider initial layers for better feature representation
+            keras.layers.Dense(512, activation='relu'),
             keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.4),
-            keras.layers.Dense(128, activation='relu'),
+            keras.layers.Dropout(0.3),  # Reduced dropout
+            # Additional layer with L2 regularization
+            keras.layers.Dense(256, activation='relu', 
+                              kernel_regularizer=keras.regularizers.l2(0.001)),
             keras.layers.BatchNormalization(),
             keras.layers.Dropout(0.3),
-            keras.layers.Dense(64, activation='relu'),
+            keras.layers.Dense(128, activation='relu'),
+            keras.layers.BatchNormalization(),
+            keras.layers.Dropout(0.2),  # Reduced dropout
             keras.layers.Dense(1, activation='sigmoid')
         ])
         
@@ -1234,11 +1244,17 @@ class ClinicalPredictionModel:
             keras.metrics.BinaryAccuracy(name='accuracy'),
             keras.metrics.AUC(name='auc'),
             keras.metrics.Precision(name='precision'),
-            keras.metrics.Recall(name='recall')
+            keras.metrics.Recall(name='recall'),
+             keras.metrics.F1Score(
+                name='f1_score',
+                threshold=0.5,         # Set explicit threshold
+                dtype=tf.float32       # Set explicit dtype
+            )
         ]
         
+        # Modify optimizer with reduced learning rate and weight decay
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0005, weight_decay=1e-5),
             loss='binary_crossentropy',
             metrics=metrics
         )
@@ -1246,22 +1262,17 @@ class ClinicalPredictionModel:
         return model
     
     def build_multi_label_model(self, input_shape, num_classes, model_type):
-        """
-        Build neural network for multi-label prediction (diagnoses, medications, procedures)
-        
-        Args:
-            input_shape: Shape of input features
-            num_classes: Number of target classes to predict
-            model_type: Type of model ('diagnosis', 'medication', or 'procedure')
-            
-        Returns:
-            Compiled TensorFlow model
-        """
         model = keras.Sequential([
             keras.layers.Input(shape=(input_shape,)),
+            # Wider layers with regularization
+            keras.layers.Dense(512, activation='relu',
+                             kernel_regularizer=keras.regularizers.l2(0.0005)),
+            keras.layers.BatchNormalization(),
+            keras.layers.Dropout(0.25),  # Adjusted dropout
+            # Additional layer for more capacity
             keras.layers.Dense(256, activation='relu'),
             keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.3),
+            keras.layers.Dropout(0.25),
             keras.layers.Dense(128, activation='relu'),
             keras.layers.BatchNormalization(),
             keras.layers.Dropout(0.2),
@@ -1273,17 +1284,79 @@ class ClinicalPredictionModel:
             keras.metrics.BinaryAccuracy(name='accuracy'),
             keras.metrics.AUC(name='auc'),
             keras.metrics.Precision(name='precision'),
-            keras.metrics.Recall(name='recall')
+            keras.metrics.Recall(name='recall'),
+            keras.metrics.F1Score(
+                name='f1_score',
+                threshold=0.5,         # Set explicit threshold
+                dtype=tf.float32       # Set explicit dtype
+            )
         ]
         
+        # Modified optimizer with reduced learning rate
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0003, weight_decay=1e-5),
             loss='binary_crossentropy',
             metrics=metrics
         )
         
         return model
-    
+        
+    def balance_multi_label_data(self, X, y, upsample_ratio=0.7):
+        """
+        Balance multi-label data through targeted upsampling
+        
+        Args:
+            X: Input features
+            y: Multi-hot encoded target array
+            upsample_ratio: Target ratio for positive samples
+            
+        Returns:
+            Balanced X and y
+        """
+        from sklearn.utils import resample
+        
+        # If target is 1D, convert to 2D
+        if len(y.shape) == 1:
+            y = y.reshape(-1, 1)
+        
+        # For each label column
+        n_labels = y.shape[1]
+        all_indices = set(range(len(X)))
+        new_X, new_y = X.copy(), y.copy()
+        
+        for label_idx in range(n_labels):
+            # Get positive samples for this label
+            pos_indices = np.where(y[:, label_idx] == 1)[0]
+            pos_count = len(pos_indices)
+            total_count = len(y)
+            
+            # Calculate how many to add for the target ratio
+            current_ratio = pos_count / total_count
+            target_count = int(total_count * upsample_ratio)
+            
+            if current_ratio < upsample_ratio and pos_count > 0:
+                # Number of samples to generate through upsampling
+                n_to_add = target_count - pos_count
+                
+                if n_to_add > 0:
+                    # Upsample positive examples
+                    pos_X = X[pos_indices]
+                    pos_y = y[pos_indices]
+                    
+                    # Resample with replacement
+                    upsampled_X, upsampled_y = resample(
+                        pos_X, pos_y, 
+                        replace=True, 
+                        n_samples=n_to_add,
+                        random_state=42
+                    )
+                    
+                    # Combine with original data
+                    new_X = np.vstack([new_X, upsampled_X])
+                    new_y = np.vstack([new_y, upsampled_y])
+        
+        return new_X, new_y
+            
     def train_models(self, timeline_df, targets):
         """
         Train prediction models for all target outcomes
@@ -1335,6 +1408,11 @@ class ClinicalPredictionModel:
                 X_train, X_test, y_train, y_test = train_test_split(
                     X, y_emergency, test_size=0.2, random_state=42, stratify=y_emergency
                 )
+
+            # For emergency visit model (binary classification)
+            if np.mean(y_train) < 0.3:  # If less than 30% are positive
+                X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
+            
             
             # Build and train model
             emergency_model = self.build_emergency_visit_model(input_shape)
@@ -1344,21 +1422,42 @@ class ClinicalPredictionModel:
             
             emergency_history = emergency_model.fit(
                 X_train, y_train,
-                epochs=50,
-                batch_size=32,
+                epochs=30,  # Increased epochs
+                batch_size=64,  # Increased batch size
                 validation_split=0.2,
                 class_weight=class_weight,
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_recall',
-                        patience=10,
+                        monitor='val_recall',  # Focus on recall
+                        patience=15,  # More patience
                         restore_best_weights=True
+                    ),
+                    # Add learning rate scheduler
+                    # Replace ReduceLROnPlateau with a simpler scheduler
+                    keras.callbacks.ReduceLROnPlateau(
+                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        factor=0.5,
+                        patience=5, 
+                        min_lr=0.00001,
+                        verbose=1
                     )
                 ],
                 verbose=1
             )
+
+            print(f"X_test shape: {X_test.shape}")
+            print(f"y_test shape: {y_test.shape}")
+            print(f"y_test dtype: {y_test.dtype}")
             
-            # Evaluate model
+            # Convert to correct types if needed
+            if not isinstance(y_test, np.ndarray):
+                y_test = np.array(y_test)
+            
+            # Ensure y_test has the right shape for binary classification
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Now evaluate
             emergency_eval = emergency_model.evaluate(X_test, y_test)
             emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
             
@@ -1387,24 +1486,50 @@ class ClinicalPredictionModel:
             diagnosis_model = self.build_multi_label_model(
                 input_shape, len(self.diagnosis_categories), 'diagnosis'
             )
+
+            # For multi-label models
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
             
             diagnosis_history = diagnosis_model.fit(
-                X_train, y_train,
-                epochs=50,
-                batch_size=32,
+               X_train, y_train,
+                epochs=30,  # Increased epochs
+                batch_size=64,  # Increased batch size
                 validation_split=0.2,
+                # Add class weighting for multi-label tasks
+                sample_weight=np.mean(y_train, axis=1) * 5.0 + 1.0,  # Emphasize positive samples
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_loss',
-                        patience=10,
+                        monitor='val_recall',  # Focus on recall
+                        patience=15,
                         restore_best_weights=True
+                    ),
+                    # Add learning rate scheduler
+                   # Replace ReduceLROnPlateau with a simpler scheduler
+                    keras.callbacks.ReduceLROnPlateau(
+                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        factor=0.5,
+                        patience=5, 
+                        min_lr=0.00001,
+                        verbose=1
                     )
                 ],
                 verbose=1
             )
             
-            # Evaluate model
-            diagnosis_eval = diagnosis_model.evaluate(X_test, y_test)
+            print(f"X_test shape: {X_test.shape}")
+            print(f"y_test shape: {y_test.shape}")
+            print(f"y_test dtype: {y_test.dtype}")
+            
+            # Convert to correct types if needed
+            if not isinstance(y_test, np.ndarray):
+                y_test = np.array(y_test)
+            
+            # Ensure y_test has the right shape for binary classification
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Now evaluate
+            diagnosis_eval = emergency_model.evaluate(X_test, y_test)
             diagnosis_metrics = {name: value for name, value in zip(diagnosis_model.metrics_names, diagnosis_eval)}
             
             # Store results
@@ -1430,6 +1555,9 @@ class ClinicalPredictionModel:
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y_medication, test_size=0.2, random_state=42
             )
+
+                        # For multi-label models
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
             
             # Build and train model
             medication_model = self.build_multi_label_model(
@@ -1437,22 +1565,45 @@ class ClinicalPredictionModel:
             )
             
             medication_history = medication_model.fit(
-                X_train, y_train,
-                epochs=50,
-                batch_size=32,
+               X_train, y_train,
+                epochs=30,  # Increased epochs
+                batch_size=64,  # Increased batch size
                 validation_split=0.2,
+                # Add class weighting for multi-label tasks
+                sample_weight=np.mean(y_train, axis=1) * 5.0 + 1.0,  # Emphasize positive samples
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_loss',
-                        patience=10,
+                        monitor='val_recall',  # Focus on recall
+                        patience=15,
                         restore_best_weights=True
+                    ),
+                    # Add learning rate scheduler
+                    # Replace ReduceLROnPlateau with a simpler scheduler
+                    keras.callbacks.ReduceLROnPlateau(
+                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        factor=0.5,
+                        patience=5, 
+                        min_lr=0.00001,
+                        verbose=1
                     )
                 ],
                 verbose=1
             )
             
-            # Evaluate model
-            medication_eval = medication_model.evaluate(X_test, y_test)
+            print(f"X_test shape: {X_test.shape}")
+            print(f"y_test shape: {y_test.shape}")
+            print(f"y_test dtype: {y_test.dtype}")
+            
+            # Convert to correct types if needed
+            if not isinstance(y_test, np.ndarray):
+                y_test = np.array(y_test)
+            
+            # Ensure y_test has the right shape for binary classification
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Now evaluate
+            medication_eval = emergency_model.evaluate(X_test, y_test)
             medication_metrics = {name: value for name, value in zip(medication_model.metrics_names, medication_eval)}
             
             # Store results
@@ -1478,6 +1629,9 @@ class ClinicalPredictionModel:
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y_procedure, test_size=0.2, random_state=42
             )
+
+                        # For multi-label models
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
             
             # Build and train model
             procedure_model = self.build_multi_label_model(
@@ -1485,22 +1639,44 @@ class ClinicalPredictionModel:
             )
             
             procedure_history = procedure_model.fit(
-                X_train, y_train,
-                epochs=50,
-                batch_size=32,
+               X_train, y_train,
+                epochs=30,  # Increased epochs
+                batch_size=64,  # Increased batch size
                 validation_split=0.2,
+                # Add class weighting for multi-label tasks
+                sample_weight=np.mean(y_train, axis=1) * 5.0 + 1.0,  # Emphasize positive samples
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_loss',
-                        patience=10,
+                        monitor='val_recall',  # Focus on recall
+                        patience=15,
                         restore_best_weights=True
+                    ),
+                    # Replace ReduceLROnPlateau with a simpler scheduler
+                    keras.callbacks.ReduceLROnPlateau(
+                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        factor=0.5,
+                        patience=5, 
+                        min_lr=0.00001,
+                        verbose=1
                     )
                 ],
                 verbose=1
             )
             
-            # Evaluate model
-            procedure_eval = procedure_model.evaluate(X_test, y_test)
+            print(f"X_test shape: {X_test.shape}")
+            print(f"y_test shape: {y_test.shape}")
+            print(f"y_test dtype: {y_test.dtype}")
+            
+            # Convert to correct types if needed
+            if not isinstance(y_test, np.ndarray):
+                y_test = np.array(y_test)
+            
+            # Ensure y_test has the right shape for binary classification
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Now evaluate
+            procedure_eval = emergency_model.evaluate(X_test, y_test)
             procedure_metrics = {name: value for name, value in zip(procedure_model.metrics_names, procedure_eval)}
             
             # Store results
