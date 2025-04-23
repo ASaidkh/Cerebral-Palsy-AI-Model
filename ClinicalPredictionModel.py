@@ -633,7 +633,7 @@ class ClinicalPredictionModel:
                 
                 # Load previous batch data
                 print(f"Loading previous batch from {last_batch_file}")
-                previous_batch = pd.read_csv(last_batch_file)
+                previous_batch = pd.read_csv(last_batch_file, low_memory=False)
                 
                 # Convert date columns
                 previous_batch['TIME_POINT'] = pd.to_datetime(previous_batch['TIME_POINT'], format='mixed', errors='coerce')
@@ -982,7 +982,7 @@ class ClinicalPredictionModel:
                 latest_file = os.path.join(output_dir, timeline_files[0])
                 
                 print(f"Loading existing timeline data from {latest_file}")
-                existing_df = pd.read_csv(latest_file)
+                existing_df = pd.read_csv(latest_file, low_memory=False)
                 
                 # Convert date columns back to datetime
                 existing_df['TIME_POINT'] = pd.to_datetime(existing_df['TIME_POINT'], format='mixed', errors='coerce')
@@ -1037,9 +1037,16 @@ class ClinicalPredictionModel:
         # Process each row
         for _, row in timeline_df.iterrows():
             # Emergency visit target (binary)
-            target_outcomes['emergency_visit'].append(row['HAD_EMERGENCY_NEXT_MONTH'])
+            # Convert string 'True'/'False' to boolean True/False, handling 'nan' as False
+            emergency_val = row['HAD_EMERGENCY_NEXT_MONTH']
+            if isinstance(emergency_val, str):
+                emergency_val = (emergency_val.lower() == 'true')
+            else:
+                emergency_val = bool(emergency_val) if pd.notna(emergency_val) else False
+                
+            target_outcomes['emergency_visit'].append(emergency_val)
             
-            # Extract list targets from string representation
+            # Rest of the method remains the same...
             try:
                 diagnoses = eval(row['NEW_DIAGNOSES_NEXT_MONTH']) if pd.notna(row['NEW_DIAGNOSES_NEXT_MONTH']) else []
                 medications = eval(row['NEW_MEDICATIONS_NEXT_MONTH']) if pd.notna(row['NEW_MEDICATIONS_NEXT_MONTH']) else []
@@ -1062,7 +1069,7 @@ class ClinicalPredictionModel:
         
         # Convert to numpy arrays
         targets = {
-            'emergency_visit': np.array(target_outcomes['emergency_visit']) if target_outcomes['emergency_visit'] else np.array([]),
+            'emergency_visit': np.array(target_outcomes['emergency_visit'], dtype=bool),  # Ensure boolean type
             'diagnoses': np.array(target_outcomes['diagnoses']) if target_outcomes['diagnoses'] else np.array([]),
             'medications': np.array(target_outcomes['medications']) if target_outcomes['medications'] else np.array([]),
             'procedures': np.array(target_outcomes['procedures']) if target_outcomes['procedures'] else np.array([])
@@ -1303,16 +1310,31 @@ class ClinicalPredictionModel:
         
         # Train emergency visit prediction model
         print("\nTraining emergency visit prediction model...")
+        # Check for valid emergency visit targets
         y_emergency = targets['emergency_visit']
-        
-        # Skip if no emergency visit targets available
         if len(y_emergency) == 0:
             print("No emergency visit target data available. Skipping this model.")
         else:
-            # Split data
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_emergency, test_size=0.2, random_state=42, stratify=y_emergency
-            )
+            # Convert to boolean array if needed
+            if y_emergency.dtype != bool and y_emergency.dtype != np.bool_:
+                y_emergency = np.array([bool(val) if val != 'nan' else False for val in y_emergency], dtype=bool)
+                
+            # Count classes to check for stratification
+            true_count = np.sum(y_emergency)
+            false_count = len(y_emergency) - true_count
+            
+            print(f"Emergency visit target distribution: True={true_count}, False={false_count}")
+            
+            # Skip stratification if one class has < 2 samples
+            if true_count < 2 or false_count < 2:
+                print("Warning: One class has less than 2 samples. Using random split instead of stratified split.")
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y_emergency, test_size=0.2, random_state=42
+                )
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y_emergency, test_size=0.2, random_state=42, stratify=y_emergency
+                )
             
             # Build and train model
             emergency_model = self.build_emergency_visit_model(input_shape)
@@ -2132,13 +2154,13 @@ class ClinicalPredictionModel:
         
         # Now load the complete CSV to return as a DataFrame
         print(f"\nLoading complete timeline from {output_csv}")
-        combined_df = pd.read_csv(output_csv)
+        combined_df = pd.read_csv(output_csv, low_memory=False)
 
         
         combined_df['TIME_POINT'] = pd.to_datetime(combined_df['TIME_POINT'], format='mixed', errors='coerce')
         
         # Convert targets to numpy arrays
-        targets = self._extract_targets_from_existing_timeline(combined__df)
+        targets = self._extract_targets_from_existing_timeline(combined_df)
         
         print(f"Processed {processed_records} new records. Total timeline now has {len(combined_df)} records.")
         
