@@ -137,8 +137,8 @@ class ClinicalPredictionModel:
         if not self.conditions_df.empty:
             # Filter out conditions that contain "finding" or "Medication review"
             filtered_conditions = self.conditions_df[
-                ~self.conditions_df['DESCRIPTION'].str.contains(
-                    r"\(finding|\(disorder|Medication review", 
+                self.conditions_df['DESCRIPTION'].str.contains(
+                    r"\(disorder\)", 
                     case=False, 
                     na=False, 
                     regex=True
@@ -153,7 +153,7 @@ class ClinicalPredictionModel:
             top_n = min(20, len(condition_counts))
             self.diagnosis_categories = condition_counts.head(top_n)['condition'].tolist()
             
-            print(f"Selected {len(self.diagnosis_categories)} diagnosis categories after filtering")
+            print(f"== Selected  {len(self.diagnosis_categories)} Diagnosis Categories: == \n {self.diagnosis_categories}")
         
         # For medication prediction - identify top medications
         if not self.medications_df.empty:
@@ -162,6 +162,7 @@ class ClinicalPredictionModel:
             # Take top 20 medications or all if less than 20
             top_n = min(20, len(medication_counts))
             self.medication_categories = medication_counts.head(top_n)['medication'].tolist()
+            print(f"== Selected  {len(self.medication_categories)} Medications Categories: ==\n {self.medication_categories}")
         
         # For procedure prediction - identify top procedures
         if not self.procedures_df.empty:
@@ -170,6 +171,7 @@ class ClinicalPredictionModel:
             # Take top 20 procedures or all if less than 20
             top_n = min(20, len(procedure_counts))
             self.procedure_categories = procedure_counts.head(top_n)['procedure'].tolist()
+            print(f"== Selected  {len(self.procedure_categories)} Procedure Categories: == \n {self.procedure_categories}")
     
     def identify_target_patients(self, condition_keywords=None):
         """
@@ -1015,6 +1017,9 @@ class ClinicalPredictionModel:
         print(f"Found {len(new_patients)} new patients to process")
         print(f"Found {len(update_patients)} existing patients to update with new data")
         
+        new_patients = False #REMOVE LATER (For TESTING PURPOSES)
+        update_patients = False #REMOVE LATER (For TESTING PURPOSES)
+
         if not new_patients and not update_patients:
             print("No new data to process. Using existing timeline.")
             # Recreate targets from existing data
@@ -1224,18 +1229,16 @@ class ClinicalPredictionModel:
     def build_emergency_visit_model(self, input_shape):
         model = keras.Sequential([
             keras.layers.Input(shape=(input_shape,)),
-            # Wider initial layers for better feature representation
-            keras.layers.Dense(512, activation='relu'),
+            # Smaller network with stronger regularization
+            keras.layers.Dense(128, activation='relu',
+                            kernel_regularizer=keras.regularizers.l2(0.01)),  # Increased L2
             keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.3),  # Reduced dropout
-            # Additional layer with L2 regularization
-            keras.layers.Dense(256, activation='relu', 
-                              kernel_regularizer=keras.regularizers.l2(0.001)),
+            keras.layers.Dropout(0.5),  # Increased dropout
+            # Single hidden layer is often sufficient for this type of problem
+            keras.layers.Dense(64, activation='relu',
+                            kernel_regularizer=keras.regularizers.l2(0.01)),
             keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.3),
-            keras.layers.Dense(128, activation='relu'),
-            keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.2),  # Reduced dropout
+            keras.layers.Dropout(0.5),
             keras.layers.Dense(1, activation='sigmoid')
         ])
         
@@ -1245,16 +1248,16 @@ class ClinicalPredictionModel:
             keras.metrics.AUC(name='auc'),
             keras.metrics.Precision(name='precision'),
             keras.metrics.Recall(name='recall'),
-             keras.metrics.F1Score(
+            keras.metrics.F1Score(
                 name='f1_score',
-                threshold=0.5,         # Set explicit threshold
-                dtype=tf.float32       # Set explicit dtype
+                threshold=0.5,
+                dtype=tf.float32
             )
         ]
         
-        # Modify optimizer with reduced learning rate and weight decay
+        # Modified optimizer with reduced learning rate
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.0005, weight_decay=1e-5),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0001, weight_decay=1e-4),
             loss='binary_crossentropy',
             metrics=metrics
         )
@@ -1264,18 +1267,16 @@ class ClinicalPredictionModel:
     def build_multi_label_model(self, input_shape, num_classes, model_type):
         model = keras.Sequential([
             keras.layers.Input(shape=(input_shape,)),
-            # Wider layers with regularization
-            keras.layers.Dense(512, activation='relu',
-                             kernel_regularizer=keras.regularizers.l2(0.0005)),
+            # Smaller initial layer
+            keras.layers.Dense(128, activation='relu',
+                            kernel_regularizer=keras.regularizers.l2(0.01)),  # Increased L2
             keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.25),  # Adjusted dropout
-            # Additional layer for more capacity
-            keras.layers.Dense(256, activation='relu'),
+            keras.layers.Dropout(0.5),  # Increased dropout
+            # Smaller network overall (removed one layer)
+            keras.layers.Dense(64, activation='relu',
+                            kernel_regularizer=keras.regularizers.l2(0.01)),  # Added L2 to all layers
             keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.25),
-            keras.layers.Dense(128, activation='relu'),
-            keras.layers.BatchNormalization(),
-            keras.layers.Dropout(0.2),
+            keras.layers.Dropout(0.5),  # Increased dropout
             keras.layers.Dense(num_classes, activation='sigmoid')
         ])
         
@@ -1287,19 +1288,159 @@ class ClinicalPredictionModel:
             keras.metrics.Recall(name='recall'),
             keras.metrics.F1Score(
                 name='f1_score',
-                threshold=0.5,         # Set explicit threshold
-                dtype=tf.float32       # Set explicit dtype
+                threshold=0.5,
+                dtype=tf.float32
             )
         ]
         
-        # Modified optimizer with reduced learning rate
+        # Modified optimizer with stronger regularization
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.0003, weight_decay=1e-5),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0001, weight_decay=1e-4),  # Reduced learning rate
             loss='binary_crossentropy',
             metrics=metrics
         )
         
         return model
+
+    def cross_validate_model(self, X, y, build_model_fn, n_splits=5):
+        """
+        Perform k-fold cross-validation for more reliable performance estimates
+        
+        Args:
+            X: Input features
+            y: Target values
+            build_model_fn: Function to build the model
+            n_splits: Number of cross-validation folds
+            
+        Returns:
+            Dictionary with cross-validation results
+        """
+        from sklearn.model_selection import StratifiedKFold
+        import numpy as np
+        
+        # For multi-label data, create a stratification target
+        # by converting the multi-hot encoding to integers
+        if len(y.shape) > 1 and y.shape[1] > 1:
+            # Use the sum of positive classes as a simple stratification target
+            strat_y = np.sum(y, axis=1).astype(int)
+            # Cap at 3 for better stratification
+            strat_y = np.minimum(strat_y, 3)
+        else:
+            strat_y = y.flatten()
+        
+        # Initialize cross-validation
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        
+        # Store metrics
+        metrics = {
+            'accuracy': [],
+            'precision': [],
+            'recall': [],
+            'auc': [],
+            'f1_score': []
+        }
+        
+        # Perform cross-validation
+        for fold, (train_idx, val_idx) in enumerate(cv.split(X, strat_y)):
+            print(f"Training fold {fold+1}/{n_splits}")
+            
+            # Split data
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+            
+            # Balance training data
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train)
+            
+            # Build and train model
+            model = build_model_fn()
+            
+            model.fit(
+                X_train, y_train,
+                epochs=15,
+                batch_size=32,
+                validation_data=(X_val, y_val),
+                callbacks=[
+                    keras.callbacks.EarlyStopping(
+                        monitor='val_loss',
+                        patience=3,
+                        restore_best_weights=True
+                    )
+                ],
+                verbose=1
+            )
+            
+            # Evaluate model
+            eval_results = model.evaluate(X_val, y_val, verbose=0)
+            
+            # Store metrics
+            for i, metric_name in enumerate(model.metrics_names):
+                if metric_name in metrics:
+                    metrics[metric_name].append(eval_results[i])
+        
+        # Calculate average metrics
+        avg_metrics = {k: np.mean(v) for k, v in metrics.items()}
+        std_metrics = {k: np.std(v) for k, v in metrics.items()}
+        
+        print("Cross-validation results:")
+        for metric in avg_metrics:
+            print(f"{metric}: {avg_metrics[metric]:.4f} ± {std_metrics[metric]:.4f}")
+        
+        return {
+            'avg_metrics': avg_metrics,
+            'std_metrics': std_metrics,
+            'all_metrics': metrics
+        }
+    
+    def select_important_features(self, X, y, feature_names, n_features=50):
+        """
+        Select the most important features using a simple model
+        
+        Args:
+            X: Input features
+            y: Target values
+            feature_names: List of feature names
+            n_features: Number of features to select
+            
+        Returns:
+            List of selected feature indices and names
+        """
+        from sklearn.ensemble import RandomForestClassifier
+        import numpy as np
+        
+        # For multi-label, we'll use the sum of positive labels as target
+        if len(y.shape) > 1:
+            # Create a binary target based on whether any positive class exists
+            target = np.any(y == 1, axis=1).astype(int)
+        else:
+            target = y
+        
+        # Train a simple random forest
+        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        rf.fit(X, target)
+        
+        # Get feature importances
+        importances = rf.feature_importances_
+        
+        # Create a dataframe of features and importances
+        import pandas as pd
+        feature_importance = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': importances
+        })
+        
+        # Sort by importance
+        feature_importance = feature_importance.sort_values('Importance', ascending=False)
+        
+        # Select top n features
+        selected_features = feature_importance.head(n_features)
+        
+        # Get indices of selected features
+        selected_indices = [list(feature_names).index(feat) for feat in selected_features['Feature']]
+        
+        print(f"Selected {len(selected_indices)} features with importance range: "
+            f"{selected_features['Importance'].min():.6f} - {selected_features['Importance'].max():.6f}")
+        
+        return selected_indices, selected_features['Feature'].tolist()
         
     def balance_multi_label_data(self, X, y, upsample_ratio=0.7):
         """
@@ -1359,7 +1500,7 @@ class ClinicalPredictionModel:
             
     def train_models(self, timeline_df, targets):
         """
-        Train prediction models for all target outcomes
+        Train prediction models for all target outcomes with improvements to prevent overfitting
         
         Args:
             timeline_df: DataFrame with patient timeline features
@@ -1369,11 +1510,20 @@ class ClinicalPredictionModel:
             Dictionary with trained models and their evaluation metrics
         """
         from sklearn.model_selection import train_test_split
+        import os
+        import numpy as np
+        from tensorflow import keras
+        import tensorflow as tf
+        from sklearn.ensemble import RandomForestClassifier
+        
+        
+        # Create directory for checkpoints
+        os.makedirs('saved_models/checkpoints', exist_ok=True)
         
         # Prepare features
         print("Preparing features...")
         features = self.prepare_features(timeline_df)
-
+        
         print("Target Columns:", targets)
         
         X = features['X_processed']
@@ -1381,85 +1531,171 @@ class ClinicalPredictionModel:
         
         results = {}
         
-        # Train emergency visit prediction model
+        
+        # ----------------- EMERGENCY VISIT MODEL -----------------
         print("\nTraining emergency visit prediction model...")
-        # Check for valid emergency visit targets
         y_emergency = targets['emergency_visit']
-        if len(y_emergency) == 0:
-            print("No emergency visit target data available. Skipping this model.")
-        else:
+        if len(y_emergency) > 0:
             # Convert to boolean array if needed
             if y_emergency.dtype != bool and y_emergency.dtype != np.bool_:
                 y_emergency = np.array([bool(val) if val != 'nan' else False for val in y_emergency], dtype=bool)
-                
-            # Count classes to check for stratification
-            true_count = np.sum(y_emergency)
-            false_count = len(y_emergency) - true_count
             
-            print(f"Emergency visit target distribution: True={true_count}, False={false_count}")
+            # Feature selection for emergency model
+            from sklearn.ensemble import RandomForestClassifier
             
-            # Skip stratification if one class has < 2 samples
-            if true_count < 2 or false_count < 2:
-                print("Warning: One class has less than 2 samples. Using random split instead of stratified split.")
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y_emergency, test_size=0.2, random_state=42
-                )
-            else:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y_emergency, test_size=0.2, random_state=42, stratify=y_emergency
-                )
+            print("Performing feature selection...")
+            feature_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+            feature_selector.fit(X, y_emergency)
+            
+            # Get feature importances and select top 30 features
+            importances = feature_selector.feature_importances_
+            indices = np.argsort(importances)[::-1]
+            top_n = 30
+            selected_indices = indices[:top_n]
 
-            # For emergency visit model (binary classification)
+            print("Selected Feature Indices: ", selected_indices)
+            
+            # Use only selected features
+            X_selected = X[:, selected_indices]
+            selected_feature_names = [features['feature_names'][i] for i in selected_indices]
+            
+            print(f"Selected {len(selected_indices)} features for emergency model")
+            print("Top 30 features:", [features['feature_names'][i] for i in indices[:30]])
+            
+            # Split data with stratification
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, y_emergency, test_size=0.2, random_state=42, 
+                stratify=y_emergency  # Ensure balanced splits
+            )
+
             if np.mean(y_train) < 0.3:  # If less than 30% are positive
-                X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
+               X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.1)
             
+            # Reshape y_train and y_test to be 2D
+            # This is the key fix for the F1Score metric error
+            if len(y_train.shape) == 1:
+                y_train = y_train.reshape(-1, 1)
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
             
-            # Build and train model
-            emergency_model = self.build_emergency_visit_model(input_shape)
+            # Print class distribution
+            pos_count = np.sum(y_train)
+            neg_count = len(y_train) - pos_count
+            print(f"Class distribution - Positive: {pos_count}/{len(y_train)} ({100*pos_count/len(y_train):.2f}%)")
             
-            class_weight = {0: 1., 1: (y_train.shape[0] - sum(y_train)) / sum(y_train)}
+            # Set class weights more conservatively
+            if pos_count / len(y_train) < 0.3:
+                class_weight = {
+                    0: 1.0, 
+                    1: min(3.0, neg_count / pos_count)  # Cap at 3x to prevent extreme weights
+                }
+            else:
+                class_weight = None
+                
             print(f"Using class weights: {class_weight}")
             
+            
+
+            # Build simplified emergency visit model
+            emergency_model = keras.Sequential([
+                keras.layers.Input(shape=(len(selected_indices),)),
+                # Smaller layer with stronger regularization
+                keras.layers.Dense(128, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),  # Increased dropout
+                # Only one hidden layer
+                keras.layers.Dense(64, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(1, activation='sigmoid')
+            ])
+            
+            # Define metrics
+            metrics = [
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.AUC(name='auc'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall'),
+                # Remove F1Score for now to simplify
+                # We can calculate it manually after training
+            ]
+            
+            # Compile with reduced learning rate
+            emergency_model.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=0.0001, weight_decay=1e-4),
+                loss='binary_crossentropy',
+                metrics=metrics
+            )
+            
+            # Create checkpoint callback
+            checkpoint_callback = keras.callbacks.ModelCheckpoint(
+                filepath='saved_models/checkpoints/emergency_model_epoch_{epoch:02d}.keras',
+                save_best_only=False,  # Save every epoch
+                save_weights_only=False,
+                verbose=1
+            )
+            
+            print("==Emergency Input Shape: ==")
+            print("X Shape: ", X_train.shape)
+            print("Y shape: ", y_train.shape)
+
+            # Train with early stopping based on loss
             emergency_history = emergency_model.fit(
                 X_train, y_train,
-                epochs=30,  # Increased epochs
-                batch_size=64,  # Increased batch size
+                epochs=50,  # Reduced epochs
+                batch_size=32,  # Smaller batch size
                 validation_split=0.2,
                 class_weight=class_weight,
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_recall',  # Focus on recall
-                        patience=15,  # More patience
+                        monitor='val_loss',  # Monitor loss instead of recall
+                        patience=10,  # Reduced patience
                         restore_best_weights=True
                     ),
-                    # Add learning rate scheduler
-                    # Replace ReduceLROnPlateau with a simpler scheduler
                     keras.callbacks.ReduceLROnPlateau(
-                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        monitor='val_loss',
                         factor=0.5,
-                        patience=5, 
+                        patience=3,
                         min_lr=0.00001,
                         verbose=1
-                    )
+                    ),
+                    checkpoint_callback
                 ],
                 verbose=1
             )
-
-            print(f"X_test shape: {X_test.shape}")
-            print(f"y_test shape: {y_test.shape}")
-            print(f"y_test dtype: {y_test.dtype}")
             
-            # Convert to correct types if needed
-            if not isinstance(y_test, np.ndarray):
-                y_test = np.array(y_test)
-            
-            # Ensure y_test has the right shape for binary classification
-            if len(y_test.shape) == 1:
-                y_test = y_test.reshape(-1, 1)
-            
-            # Now evaluate
+            # Evaluate model
+            print("Evaluating emergency model...")
             emergency_eval = emergency_model.evaluate(X_test, y_test)
             emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
+            
+            # Get predictions
+            y_pred_prob = emergency_model.predict(X_test).flatten()
+            
+            # Find optimal threshold
+            from sklearn.metrics import precision_recall_curve, f1_score
+            precision, recall, thresholds = precision_recall_curve(y_test, y_pred_prob)
+            f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
+            best_idx = np.argmax(f1_scores)
+            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+            
+            print(f"Optimal threshold: {best_threshold:.4f}")
+            
+            # Get predictions at optimal threshold
+            y_pred = (y_pred_prob >= best_threshold).astype(int)
+            
+            # Calculate F1 score manually
+            from sklearn.metrics import f1_score
+            f1 = f1_score(y_test, y_pred)
+            emergency_metrics['f1_score'] = f1
+            print(f"F1 Score: {f1:.4f}")
+            
+            # Calculate final metrics
+            from sklearn.metrics import classification_report, confusion_matrix
+            print("\nClassification report:")
+            print(classification_report(y_test, y_pred))
             
             # Store results
             results['emergency_visit'] = {
@@ -1467,70 +1703,173 @@ class ClinicalPredictionModel:
                 'history': emergency_history.history,
                 'metrics': emergency_metrics,
                 'y_test': y_test,
-                'y_pred': emergency_model.predict(X_test)
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'best_threshold': best_threshold,
+                'selected_features': selected_feature_names
             }
             
             print(f"Emergency visit model metrics: {emergency_metrics}")
-        
-        # Train diagnosis prediction model
+      
+        # ----------------- DIAGNOSIS MODEL -----------------
         if len(self.diagnosis_categories) > 0 and 'diagnoses' in targets and len(targets['diagnoses']) > 0:
             print("\nTraining diagnosis prediction model...")
             y_diagnosis = targets['diagnoses']
             
+            # Feature selection for diagnosis model
+            print("Performing feature selection for diagnosis model...")
+            # Create a target for feature selection (presence of any diagnosis)
+            y_any_diagnosis = np.any(y_diagnosis == 1, axis=1).astype(int)
+            
+            feature_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+            feature_selector.fit(X, y_any_diagnosis)
+            
+            # Get feature importances and select top features
+            importances = feature_selector.feature_importances_
+            indices = np.argsort(importances)[::-1]
+            top_n = 30  # More features for multi-label
+            selected_indices = indices[:top_n]
+            print("Selected Feature Indices: ", selected_indices)
+            # Use only selected features
+            X_selected = X[:, selected_indices]
+            selected_feature_names = [features['feature_names'][i] for i in selected_indices]
+            
+            print(f"Selected {len(selected_indices)} features for diagnosis model")
+            print("Top 40 features:", [features['feature_names'][i] for i in indices[:30]])
+            
             # Split data
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y_diagnosis, test_size=0.2, random_state=42
-            )
-            
-            # Build and train model
-            diagnosis_model = self.build_multi_label_model(
-                input_shape, len(self.diagnosis_categories), 'diagnosis'
+                X_selected, y_diagnosis, test_size=0.2, random_state=42
             )
 
-            # For multi-label models
-            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.5)
+
+            print("==Diagnosis Input Shape Before Reshaping: ==")
+            print("X Shape: ", X_train.shape)
+            print("Y shape: ", y_train.shape)
             
+            # Check and ensure y_train and y_test are in the right shape
+            # For multi-label, they should already be 2D, but let's verify
+            if len(y_train.shape) == 1:
+                y_train = y_train.reshape(-1, 1)
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Simplified balancing approach
+            # Just undersample negative examples to maintain a reasonable ratio
+            pos_mask = np.any(y_train == 1, axis=1)
+            pos_indices = np.where(pos_mask)[0]
+            neg_indices = np.where(~pos_mask)[0]
+            
+            # If we have too many negative examples
+            if len(neg_indices) > 3 * len(pos_indices) and len(pos_indices) > 0:
+                # Randomly select negative samples
+                np.random.seed(42)
+                selected_neg_indices = np.random.choice(
+                    neg_indices, size=3 * len(pos_indices), replace=False
+                )
+                
+                # Combine indices
+                selected_sample_indices = np.concatenate([pos_indices, selected_neg_indices])
+                
+                # Create balanced datasets
+                X_train = X_train[selected_sample_indices]
+                y_train = y_train[selected_sample_indices]
+            
+            # Build a simplified multi-label model
+            diagnosis_model = keras.Sequential([
+                keras.layers.Input(shape=(len(selected_indices),)),
+                # Smaller network with stronger regularization
+                keras.layers.Dense(256, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                # Only one hidden layer
+                keras.layers.Dense(128, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(len(self.diagnosis_categories), activation='sigmoid')
+            ])
+            
+            # Define metrics - removing F1Score to avoid shape issues
+            metrics = [
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.AUC(name='auc'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall')
+            ]
+            
+            # Compile with reduced learning rate
+            diagnosis_model.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=0.0001, weight_decay=1e-4),
+                loss='binary_crossentropy',
+                metrics=metrics
+            )
+            
+            # Create checkpoint callback
+            checkpoint_callback = keras.callbacks.ModelCheckpoint(
+                filepath='saved_models/checkpoints/diagnosis_model_epoch_{epoch:02d}.keras',
+                save_best_only=False,
+                save_weights_only=False,
+                verbose=1
+            )
+            
+            # Simplified training with sample weights instead of class weights
+            # This works better for multi-label classification
+            sample_weights = np.ones(len(y_train))
+            pos_samples = np.sum(y_train, axis=1) > 0
+            sample_weights[pos_samples] = 3.0  # Weight positive samples higher
+            
+
+            print("==Diagnosis Input After Reshaping: ==")
+            print("X Shape: ", X_train.shape)
+            print("Y shape: ", y_train.shape)
+
             diagnosis_history = diagnosis_model.fit(
-               X_train, y_train,
-                epochs=30,  # Increased epochs
-                batch_size=64,  # Increased batch size
+                X_train, y_train,
+                epochs=30,  # Reduced epochs
+                batch_size=32,  # Smaller batch size
                 validation_split=0.2,
-                # Add class weighting for multi-label tasks
-                sample_weight=np.mean(y_train, axis=1) * 5.0 + 1.0,  # Emphasize positive samples
+                sample_weight=sample_weights,  # Use sample weights instead of class weights
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_recall',  # Focus on recall
-                        patience=15,
+                        monitor='val_loss',  # Monitor loss instead of recall
+                        patience=3,  # Reduced patience
                         restore_best_weights=True
                     ),
-                    # Add learning rate scheduler
-                   # Replace ReduceLROnPlateau with a simpler scheduler
                     keras.callbacks.ReduceLROnPlateau(
-                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        monitor='val_loss',
                         factor=0.5,
-                        patience=5, 
+                        patience=2,
                         min_lr=0.00001,
                         verbose=1
-                    )
+                    ),
+                    checkpoint_callback
                 ],
                 verbose=1
             )
             
-            print(f"X_test shape: {X_test.shape}")
-            print(f"y_test shape: {y_test.shape}")
-            print(f"y_test dtype: {y_test.dtype}")
-            
-            # Convert to correct types if needed
-            if not isinstance(y_test, np.ndarray):
-                y_test = np.array(y_test)
-            
-            # Ensure y_test has the right shape for binary classification
-            if len(y_test.shape) == 1:
-                y_test = y_test.reshape(-1, 1)
-            
-            # Now evaluate
-            diagnosis_eval = emergency_model.evaluate(X_test, y_test)
+            # Evaluate model
+            print("Evaluating diagnosis model...")
+            diagnosis_eval = diagnosis_model.evaluate(X_test, y_test)
             diagnosis_metrics = {name: value for name, value in zip(diagnosis_model.metrics_names, diagnosis_eval)}
+            
+            # Get predictions
+            y_pred_prob = diagnosis_model.predict(X_test)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            
+            # Calculate F1 scores manually
+            from sklearn.metrics import f1_score
+            # Calculate f1 for each class
+            f1_scores = []
+            for i in range(y_test.shape[1]):
+                f1 = f1_score(y_test[:, i], y_pred[:, i])
+                f1_scores.append(f1)
+            # Average F1 score
+            avg_f1 = np.mean(f1_scores)
+            diagnosis_metrics['f1_score'] = avg_f1
+            print(f"Average F1 Score: {avg_f1:.4f}")
             
             # Store results
             results['diagnosis'] = {
@@ -1538,73 +1877,164 @@ class ClinicalPredictionModel:
                 'history': diagnosis_history.history,
                 'metrics': diagnosis_metrics,
                 'y_test': y_test,
-                'y_pred': diagnosis_model.predict(X_test),
-                'categories': self.diagnosis_categories
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'categories': self.diagnosis_categories,
+                'selected_features': selected_feature_names
             }
             
             print(f"Diagnosis model metrics: {diagnosis_metrics}")
         else:
             print("\nSkipping diagnosis model: no diagnosis categories or target data available")
-        
-        # Train medication prediction model
+
+        # ----------------- MEDICATION MODEL -----------------
         if len(self.medication_categories) > 0 and 'medications' in targets and len(targets['medications']) > 0:
             print("\nTraining medication prediction model...")
             y_medication = targets['medications']
             
+            # Feature selection for medication model
+            print("Performing feature selection for medication model...")
+            # Create a target for feature selection (presence of any medication)
+            y_any_medication = np.any(y_medication == 1, axis=1).astype(int)
+            
+            feature_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+            feature_selector.fit(X, y_any_medication)
+            
+            # Get feature importances and select top features
+            importances = feature_selector.feature_importances_
+            indices = np.argsort(importances)[::-1]
+            top_n = 30  # More features for multi-label
+            selected_indices = indices[:top_n]
+            print("Selected Feature Indices: ", selected_indices)
+            # Use only selected features
+            X_selected = X[:, selected_indices]
+            selected_feature_names = [features['feature_names'][i] for i in selected_indices]
+            
+            print(f"Selected {len(selected_indices)} features for medication model")
+            print("Top 40 features:", [features['feature_names'][i] for i in indices[:30]])
+            
             # Split data
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y_medication, test_size=0.2, random_state=42
+                X_selected, y_medication, test_size=0.2, random_state=42
             )
 
-                        # For multi-label models
-            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.5)
             
-            # Build and train model
-            medication_model = self.build_multi_label_model(
-                input_shape, len(self.medication_categories), 'medication'
+            # Check and ensure y_train and y_test are in the right shape
+            if len(y_train.shape) == 1:
+                y_train = y_train.reshape(-1, 1)
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Simplified balancing approach
+            pos_mask = np.any(y_train == 1, axis=1)
+            pos_indices = np.where(pos_mask)[0]
+            neg_indices = np.where(~pos_mask)[0]
+            
+            # If we have too many negative examples
+            if len(neg_indices) > 3 * len(pos_indices) and len(pos_indices) > 0:
+                # Randomly select negative samples
+                np.random.seed(42)
+                selected_neg_indices = np.random.choice(
+                    neg_indices, size=3 * len(pos_indices), replace=False
+                )
+                
+                # Combine indices
+                selected_sample_indices = np.concatenate([pos_indices, selected_neg_indices])
+                
+                # Create balanced datasets
+                X_train = X_train[selected_sample_indices]
+                y_train = y_train[selected_sample_indices]
+            
+            # Build a simplified multi-label model
+            medication_model = keras.Sequential([
+                keras.layers.Input(shape=(len(selected_indices),)),
+                # Smaller network with stronger regularization
+                keras.layers.Dense(256, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                # Only one hidden layer
+                keras.layers.Dense(128, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(len(self.medication_categories), activation='sigmoid')
+            ])
+            
+            # Define metrics - removing F1Score
+            metrics = [
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.AUC(name='auc'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall')
+            ]
+            
+            # Compile with reduced learning rate
+            medication_model.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=0.0001, weight_decay=1e-4),
+                loss='binary_crossentropy',
+                metrics=metrics
             )
             
+            # Create checkpoint callback
+            checkpoint_callback = keras.callbacks.ModelCheckpoint(
+                filepath='saved_models/checkpoints/medication_model_epoch_{epoch:02d}.keras',
+                save_best_only=False,
+                save_weights_only=False,
+                verbose=1
+            )
+            
+            # Sample weights instead of class weights
+            sample_weights = np.ones(len(y_train))
+            pos_samples = np.sum(y_train, axis=1) > 0
+            sample_weights[pos_samples] = 3.0  # Weight positive samples higher
+            
+            # Simplified training
             medication_history = medication_model.fit(
-               X_train, y_train,
-                epochs=30,  # Increased epochs
-                batch_size=64,  # Increased batch size
+                X_train, y_train,
+                epochs=30,  # Reduced epochs
+                batch_size=32,  # Smaller batch size
                 validation_split=0.2,
-                # Add class weighting for multi-label tasks
-                sample_weight=np.mean(y_train, axis=1) * 5.0 + 1.0,  # Emphasize positive samples
+                sample_weight=sample_weights,
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_recall',  # Focus on recall
-                        patience=15,
+                        monitor='val_loss',  # Monitor loss instead of recall
+                        patience=3,  # Reduced patience
                         restore_best_weights=True
                     ),
-                    # Add learning rate scheduler
-                    # Replace ReduceLROnPlateau with a simpler scheduler
                     keras.callbacks.ReduceLROnPlateau(
-                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        monitor='val_loss',
                         factor=0.5,
-                        patience=5, 
+                        patience=2,
                         min_lr=0.00001,
                         verbose=1
-                    )
+                    ),
+                    checkpoint_callback
                 ],
                 verbose=1
             )
             
-            print(f"X_test shape: {X_test.shape}")
-            print(f"y_test shape: {y_test.shape}")
-            print(f"y_test dtype: {y_test.dtype}")
-            
-            # Convert to correct types if needed
-            if not isinstance(y_test, np.ndarray):
-                y_test = np.array(y_test)
-            
-            # Ensure y_test has the right shape for binary classification
-            if len(y_test.shape) == 1:
-                y_test = y_test.reshape(-1, 1)
-            
-            # Now evaluate
-            medication_eval = emergency_model.evaluate(X_test, y_test)
+            # Evaluate model
+            print("Evaluating medication model...")
+            medication_eval = medication_model.evaluate(X_test, y_test)
             medication_metrics = {name: value for name, value in zip(medication_model.metrics_names, medication_eval)}
+            
+            # Get predictions
+            y_pred_prob = medication_model.predict(X_test)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            
+            # Calculate F1 scores manually
+            from sklearn.metrics import f1_score
+            # Calculate f1 for each class
+            f1_scores = []
+            for i in range(y_test.shape[1]):
+                f1 = f1_score(y_test[:, i], y_pred[:, i])
+                f1_scores.append(f1)
+            # Average F1 score
+            avg_f1 = np.mean(f1_scores)
+            medication_metrics['f1_score'] = avg_f1
+            print(f"Average F1 Score: {avg_f1:.4f}")
             
             # Store results
             results['medication'] = {
@@ -1612,72 +2042,166 @@ class ClinicalPredictionModel:
                 'history': medication_history.history,
                 'metrics': medication_metrics,
                 'y_test': y_test,
-                'y_pred': medication_model.predict(X_test),
-                'categories': self.medication_categories
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'categories': self.medication_categories,
+                'selected_features': selected_feature_names
             }
             
             print(f"Medication model metrics: {medication_metrics}")
         else:
             print("\nSkipping medication model: no medication categories or target data available")
-        
-        # Train procedure prediction model
+
+        # ----------------- PROCEDURE MODEL -----------------
         if len(self.procedure_categories) > 0 and 'procedures' in targets and len(targets['procedures']) > 0:
             print("\nTraining procedure prediction model...")
             y_procedure = targets['procedures']
             
+            # Feature selection for procedure model
+            print("Performing feature selection for procedure model...")
+            # Create a target for feature selection (presence of any procedure)
+            y_any_procedure = np.any(y_procedure == 1, axis=1).astype(int)
+            
+            feature_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+            feature_selector.fit(X, y_any_procedure)
+            
+            # Get feature importances and select top features
+            importances = feature_selector.feature_importances_
+            indices = np.argsort(importances)[::-1]
+            top_n = 30  # More features for multi-label
+            selected_indices = indices[:top_n]
+
+            print("Selected Feature Indices: ", selected_indices)
+            
+            # Use only selected features
+            X_selected = X[:, selected_indices]
+            selected_feature_names = [features['feature_names'][i] for i in selected_indices]
+            
+            print(f"Selected {len(selected_indices)} features for procedure model")
+            print("Top 30 features:", [features['feature_names'][i] for i in indices[:30]])
+            
             # Split data
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y_procedure, test_size=0.2, random_state=42
+                X_selected, y_procedure, test_size=0.2, random_state=42
             )
 
-                        # For multi-label models
-            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.4)
+            X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.6)
             
-            # Build and train model
-            procedure_model = self.build_multi_label_model(
-                input_shape, len(self.procedure_categories), 'procedure'
+            # Check and ensure y_train and y_test are in the right shape
+            if len(y_train.shape) == 1:
+                y_train = y_train.reshape(-1, 1)
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+            
+            # Simplified balancing approach
+            pos_mask = np.any(y_train == 1, axis=1)
+            pos_indices = np.where(pos_mask)[0]
+            neg_indices = np.where(~pos_mask)[0]
+            
+            # If we have too many negative examples
+            if len(neg_indices) > 3 * len(pos_indices) and len(pos_indices) > 0:
+                # Randomly select negative samples
+                np.random.seed(42)
+                selected_neg_indices = np.random.choice(
+                    neg_indices, size=3 * len(pos_indices), replace=False
+                )
+                
+                # Combine indices
+                selected_sample_indices = np.concatenate([pos_indices, selected_neg_indices])
+                
+                # Create balanced datasets
+                X_train = X_train[selected_sample_indices]
+                y_train = y_train[selected_sample_indices]
+            
+            # Build a simplified multi-label model
+            procedure_model = keras.Sequential([
+                keras.layers.Input(shape=(len(selected_indices),)),
+                # Smaller network with stronger regularization
+                keras.layers.Dense(256, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                # Only one hidden layer
+                keras.layers.Dense(128, activation='relu',
+                                kernel_regularizer=keras.regularizers.l2(0.01)),
+                keras.layers.BatchNormalization(),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(len(self.procedure_categories), activation='sigmoid')
+            ])
+            
+            # Define metrics - removing F1Score
+            metrics = [
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.AUC(name='auc'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall')
+            ]
+            
+            # Compile with reduced learning rate
+            procedure_model.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=0.0001, weight_decay=1e-4),
+                loss='binary_crossentropy',
+                metrics=metrics
             )
             
+            # Create checkpoint callback
+            checkpoint_callback = keras.callbacks.ModelCheckpoint(
+                filepath='saved_models/checkpoints/procedure_model_epoch_{epoch:02d}.keras',
+                save_best_only=False,
+                save_weights_only=False,
+                verbose=1
+            )
+            
+            # Sample weights instead of class weights
+            sample_weights = np.ones(len(y_train))
+            pos_samples = np.sum(y_train, axis=1) > 0
+            sample_weights[pos_samples] = 3.0  # Weight positive samples higher
+            
+            # Simplified training
             procedure_history = procedure_model.fit(
-               X_train, y_train,
-                epochs=30,  # Increased epochs
-                batch_size=64,  # Increased batch size
+                X_train, y_train,
+                epochs=30,  # Reduced epochs
+                batch_size=32,  # Smaller batch size
                 validation_split=0.2,
-                # Add class weighting for multi-label tasks
-                sample_weight=np.mean(y_train, axis=1) * 5.0 + 1.0,  # Emphasize positive samples
+                sample_weight=sample_weights,
                 callbacks=[
                     keras.callbacks.EarlyStopping(
-                        monitor='val_recall',  # Focus on recall
-                        patience=15,
+                        monitor='val_loss',  # Monitor loss instead of recall
+                        patience=3,  # Reduced patience
                         restore_best_weights=True
                     ),
-                    # Replace ReduceLROnPlateau with a simpler scheduler
                     keras.callbacks.ReduceLROnPlateau(
-                        monitor='val_loss',  # Monitor val_loss instead of val_recall
+                        monitor='val_loss',
                         factor=0.5,
-                        patience=5, 
+                        patience=2,
                         min_lr=0.00001,
                         verbose=1
-                    )
+                    ),
+                    checkpoint_callback
                 ],
                 verbose=1
             )
             
-            print(f"X_test shape: {X_test.shape}")
-            print(f"y_test shape: {y_test.shape}")
-            print(f"y_test dtype: {y_test.dtype}")
-            
-            # Convert to correct types if needed
-            if not isinstance(y_test, np.ndarray):
-                y_test = np.array(y_test)
-            
-            # Ensure y_test has the right shape for binary classification
-            if len(y_test.shape) == 1:
-                y_test = y_test.reshape(-1, 1)
-            
-            # Now evaluate
-            procedure_eval = emergency_model.evaluate(X_test, y_test)
+            # Evaluate model
+            print("Evaluating procedure model...")
+            procedure_eval = procedure_model.evaluate(X_test, y_test)
             procedure_metrics = {name: value for name, value in zip(procedure_model.metrics_names, procedure_eval)}
+            
+            # Get predictions
+            y_pred_prob = procedure_model.predict(X_test)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            
+            # Calculate F1 scores manually
+            from sklearn.metrics import f1_score
+            # Calculate f1 for each class
+            f1_scores = []
+            for i in range(y_test.shape[1]):
+                f1 = f1_score(y_test[:, i], y_pred[:, i])
+                f1_scores.append(f1)
+            # Average F1 score
+            avg_f1 = np.mean(f1_scores)
+            procedure_metrics['f1_score'] = avg_f1
+            print(f"Average F1 Score: {avg_f1:.4f}")
             
             # Store results
             results['procedure'] = {
@@ -1685,8 +2209,10 @@ class ClinicalPredictionModel:
                 'history': procedure_history.history,
                 'metrics': procedure_metrics,
                 'y_test': y_test,
-                'y_pred': procedure_model.predict(X_test),
-                'categories': self.procedure_categories
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'categories': self.procedure_categories,
+                'selected_features': selected_feature_names
             }
             
             print(f"Procedure model metrics: {procedure_metrics}")
@@ -1698,7 +2224,8 @@ class ClinicalPredictionModel:
         
         # Update models dictionary
         for key, value in results.items():
-            self.models[key] = value['model']
+            if 'model' in value:
+                self.models[key] = value['model']
         
         # Save training history and create plots
         self.save_training_history(results)
@@ -1735,7 +2262,8 @@ class ClinicalPredictionModel:
             metadata = {
                 'timestamp': timestamp,
                 'metrics': {k: float(v) for k, v in result.get('metrics', {}).items()},
-                'categories': result.get('categories', [])
+                'categories': result.get('categories', []),
+                'selected_features': result.get('selected_features', [])
             }
             
             metadata_path = os.path.join(output_dir, 'metadata', f"{model_type}_metadata_{timestamp}.json")
