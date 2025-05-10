@@ -150,7 +150,7 @@ class ClinicalPredictionModel:
             condition_counts.columns = ['condition', 'count']
             
             # Take top 20 conditions or all if less than 20
-            top_n = min(20, len(condition_counts))
+            top_n = min(50, len(condition_counts))
             self.diagnosis_categories = condition_counts.head(top_n)['condition'].tolist()
             
             print(f"== Selected  {len(self.diagnosis_categories)} Diagnosis Categories: == \n {self.diagnosis_categories}")
@@ -160,7 +160,7 @@ class ClinicalPredictionModel:
             medication_counts = self.medications_df['DESCRIPTION'].value_counts().reset_index()
             medication_counts.columns = ['medication', 'count']
             # Take top 20 medications or all if less than 20
-            top_n = min(20, len(medication_counts))
+            top_n = min(50, len(medication_counts))
             self.medication_categories = medication_counts.head(top_n)['medication'].tolist()
             print(f"== Selected  {len(self.medication_categories)} Medications Categories: ==\n {self.medication_categories}")
         
@@ -169,7 +169,7 @@ class ClinicalPredictionModel:
             procedure_counts = self.procedures_df['DESCRIPTION'].value_counts().reset_index()
             procedure_counts.columns = ['procedure', 'count']
             # Take top 20 procedures or all if less than 20
-            top_n = min(20, len(procedure_counts))
+            top_n = min(50, len(procedure_counts))
             self.procedure_categories = procedure_counts.head(top_n)['procedure'].tolist()
             print(f"== Selected  {len(self.procedure_categories)} Procedure Categories: == \n {self.procedure_categories}")
     
@@ -1017,8 +1017,6 @@ class ClinicalPredictionModel:
         print(f"Found {len(new_patients)} new patients to process")
         print(f"Found {len(update_patients)} existing patients to update with new data")
         
-        new_patients = False #REMOVE LATER (For TESTING PURPOSES)
-        update_patients = False #REMOVE LATER (For TESTING PURPOSES)
 
         if not new_patients and not update_patients:
             print("No new data to process. Using existing timeline.")
@@ -1531,7 +1529,7 @@ class ClinicalPredictionModel:
         
         results = {}
         
-        
+        '''
         # ----------------- EMERGENCY VISIT MODEL -----------------
         print("\nTraining emergency visit prediction model...")
         y_emergency = targets['emergency_visit']
@@ -1569,7 +1567,7 @@ class ClinicalPredictionModel:
             )
 
             if np.mean(y_train) < 0.3:  # If less than 30% are positive
-               X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.1)
+               X_train, y_train = self.balance_multi_label_data(X_train, y_train, upsample_ratio=0.2)
             
             # Reshape y_train and y_test to be 2D
             # This is the key fix for the F1Score metric error
@@ -1710,7 +1708,7 @@ class ClinicalPredictionModel:
             }
             
             print(f"Emergency visit model metrics: {emergency_metrics}")
-      
+        '''
         # ----------------- DIAGNOSIS MODEL -----------------
         if len(self.diagnosis_categories) > 0 and 'diagnoses' in targets and len(targets['diagnoses']) > 0:
             print("\nTraining diagnosis prediction model...")
