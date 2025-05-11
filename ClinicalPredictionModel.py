@@ -10,6 +10,15 @@ from collections import defaultdict
 import os
 from datetime import datetime, timedelta
 import json
+import keras_tuner as kt
+from sklearn.feature_selection import RFE, RFECV, SelectFromModel, SelectKBest, f_classif, mutual_info_classif
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import Lasso, ElasticNet
+from sklearn.model_selection import StratifiedKFold, train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from boruta import BorutaPy
+import shap
 
 class ClinicalPredictionModel:
     def __init__(self, data_dir):
@@ -1169,20 +1178,38 @@ class ClinicalPredictionModel:
         
         return {f'UTIL_{k}': v for k, v in metrics.items()}
     
-    def prepare_features(self, timeline_df):
+    def prepare_features(self, timeline_df, exclude_cols=None):
         """
         Prepare features for model training, handling missing values and scaling
         
         Args:
             timeline_df: DataFrame with patient timeline features
+            exclude_cols: List of columns to exclude from feature set (defaults to time and target cols)
             
         Returns:
             Dictionary with processed features and metadata
         """
-        # Separate features from targets
-        X = timeline_df.drop(['PATIENT_ID', 'TIME_POINT', 'HAD_EMERGENCY_NEXT_MONTH', 
-                            'NEW_DIAGNOSES_NEXT_MONTH', 'NEW_MEDICATIONS_NEXT_MONTH', 
-                            'NEW_PROCEDURES_NEXT_MONTH'], axis=1, errors='ignore')
+        # Define default columns to exclude if not provided
+        if exclude_cols is None:
+            exclude_cols = [
+                'PATIENT_ID', 'TIME_POINT', 'HAD_EMERGENCY_NEXT_MONTH', 
+                'NEW_DIAGNOSES_NEXT_MONTH', 'NEW_MEDICATIONS_NEXT_MONTH', 
+                'NEW_PROCEDURES_NEXT_MONTH'
+            ]
+        
+        # Identify all columns to exclude
+        cols_to_exclude = []
+        for col in exclude_cols:
+            matching_cols = [c for c in timeline_df.columns if c == col or c.startswith(col + '_')]
+            cols_to_exclude.extend(matching_cols)
+        
+        # Print diagnostic information
+        print(f"Total columns: {len(timeline_df.columns)}")
+        print(f"Columns being excluded: {cols_to_exclude}")
+        
+        # Separate features from targets and metadata
+        X = timeline_df.drop(cols_to_exclude, axis=1, errors='ignore')
+        print(f"Feature columns after exclusion: {len(X.columns)}")
         
         # Convert problematic numeric columns to numeric type with NaN for non-convertible values
         numeric_prefixes = ['VITAL_', 'COND_', 'MED_', 'PROC_', 'IMG_', 'DEV_', 'ALLERGY_', 
@@ -1199,7 +1226,14 @@ class ClinicalPredictionModel:
         categorical_features = [col for col in X.columns if col.startswith('DEM_') and col not in ['DEM_AGE_YEARS']]
         numerical_features = [col for col in X.columns if col not in categorical_features]
         
+        print(f"Identified {len(categorical_features)} categorical and {len(numerical_features)} numerical features")
+        
         # Create preprocessor
+        from sklearn.compose import ColumnTransformer
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler, OneHotEncoder
+        from sklearn.impute import SimpleImputer
+        
         preprocessor = ColumnTransformer(
             transformers=[
                 ('num', Pipeline([
@@ -1214,12 +1248,56 @@ class ClinicalPredictionModel:
         )
         
         # Fit preprocessor
-        X_processed = preprocessor.fit_transform(X)
+        try:
+            X_processed = preprocessor.fit_transform(X)
+        except Exception as e:
+            print(f"Error in preprocessing: {e}")
+            # Simplified preprocessing as fallback
+            print("Falling back to simplified preprocessing...")
+            preprocessor = ColumnTransformer(
+                transformers=[
+                    ('num', StandardScaler(), numerical_features),
+                    ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+                ],
+                remainder='passthrough'
+            )
+            X_processed = preprocessor.fit_transform(X)
+        
+        # Get feature names after preprocessing
+        feature_names_processed = []
+        
+        try:
+            # Try using get_feature_names_out (newer scikit-learn versions)
+            feature_names_processed = preprocessor.get_feature_names_out()
+        except:
+            try:
+                # For older scikit-learn versions
+                num_features = [f"{col}" for col in numerical_features]
+                
+                cat_features = []
+                if categorical_features:
+                    cat_transformer = preprocessor.transformers_[1][1]
+                    if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
+                        onehot = cat_transformer.named_steps['onehot']
+                        if hasattr(onehot, 'get_feature_names_out'):
+                            cat_features = onehot.get_feature_names_out(categorical_features)
+                        elif hasattr(onehot, 'get_feature_names'):
+                            cat_features = onehot.get_feature_names(categorical_features)
+                
+                feature_names_processed = num_features + list(cat_features)
+            except Exception as e:
+                print(f"Could not extract processed feature names: {e}")
+                # Generate generic feature names
+                feature_names_processed = [f"feature_{i}" for i in range(X_processed.shape[1])]
+        
+        print(f"Original feature count: {len(X.columns)}, Processed feature count: {len(feature_names_processed)}")
         
         return {
-            'X_processed': X_processed,
+            'X': X,  # Original features DataFrame
+            'X_processed': X_processed,  # Transformed feature matrix
             'preprocessor': preprocessor,
-            'feature_names': X.columns.tolist(),
+            'feature_names': X.columns.tolist(),  # Original feature names
+            'feature_names_processed': feature_names_processed,  # Post-transformation feature names
             'categorical_features': categorical_features,
             'numerical_features': numerical_features
         }
@@ -2669,7 +2747,8 @@ class ClinicalPredictionModel:
                     import traceback
                     traceback.print_exc()
                     continue
-        
+        update_patients = False #REMOVE LATER, JUST TO PREVENT NEEDLESS COMPUTATION
+
         # Process update patients (existing patients that need new months added)
         if update_patients and append_new_months:
             print(f"\nUpdating {len(update_patients)} existing patients:")
@@ -3600,3 +3679,1908 @@ class ClinicalPredictionModel:
         radar_path = os.path.join(plots_dir, f'model_comparison_radar_{timestamp}.png')
         plt.savefig(radar_path, bbox_inches='tight')
         plt.close()
+
+    def train_optimized_models(self, timeline_df, targets):
+        """
+        Train prediction models with hyperparameter optimization
+        
+        Args:
+            timeline_df: DataFrame with patient timeline features
+            targets: Dictionary with target arrays for each prediction task
+            
+        Returns:
+            Dictionary with optimized models and their evaluation metrics
+        """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from sklearn.model_selection import train_test_split
+        
+        # Create output directories
+        os.makedirs('hyperparameter_tuning', exist_ok=True)
+        os.makedirs('feature_selection', exist_ok=True)
+        
+        # Prepare features with explicit exclusion of non-feature columns
+        exclude_cols = [
+            'PATIENT_ID', 'TIME_POINT', 
+            'HAD_EMERGENCY_NEXT_MONTH', 'NEW_DIAGNOSES_NEXT_MONTH',
+            'NEW_MEDICATIONS_NEXT_MONTH', 'NEW_PROCEDURES_NEXT_MONTH'
+        ]
+        
+        print("Preparing features for optimized models...")
+        features = self.prepare_features(timeline_df, exclude_cols)
+        
+        X = features['X_processed']
+        print(f"Processed feature matrix shape: {X.shape}")
+        
+        # Ensure we have the correct feature names that match the processed feature matrix
+        processed_feature_names = features['feature_names_processed']
+        
+        # Check if feature names match processed feature matrix dimensions
+        if len(processed_feature_names) != X.shape[1]:
+            print(f"WARNING: Processed feature names length ({len(processed_feature_names)}) doesn't match feature matrix ({X.shape[1]})")
+            # Generate generic feature names that match the matrix dimensions
+            processed_feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+        
+        results = {}
+        
+        # ----------------- EMERGENCY VISIT MODEL -----------------
+        if 'emergency_visit' in targets and len(targets['emergency_visit']) > 0:
+            print("\nOptimizing emergency visit prediction model...")
+            y_emergency = targets['emergency_visit']
+            
+            # Convert to boolean array if needed
+            if y_emergency.dtype != bool and y_emergency.dtype != np.bool_:
+                y_emergency = np.array([bool(val) if val != 'nan' else False for val in y_emergency], dtype=bool)
+            
+            # Perform enhanced feature selection
+            print("Performing enhanced feature selection for emergency model...")
+            feature_selection_results = self.enhanced_feature_selection(
+                X, y_emergency, processed_feature_names, 
+                n_features=30,  # Select top 30 features
+                method='ensemble'  # Use ensemble of methods for better selection
+            )
+            
+            # Use only selected features
+            X_selected = X[:, feature_selection_results['selected_indices']]
+            selected_feature_names = feature_selection_results['selected_features']
+            
+            print(f"Selected {len(selected_feature_names)} features for emergency model")
+            
+            # Split data for model tuning
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, y_emergency, test_size=0.2, random_state=42,
+                stratify=y_emergency  # Ensure balanced splits
+            )
+            
+            # Further split train into train/validation for hyperparameter tuning
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=42,
+                stratify=y_train
+            )
+            
+            # Run hyperparameter tuning
+            print("Running hyperparameter tuning for emergency model...")
+            tuning_results = self.tune_model_hyperparameters(
+                X_train, y_train, X_val, y_val,
+                model_type='binary',
+                tuning_epochs=30,
+                max_trials=20
+            )
+            
+            # Get best model
+            emergency_model = tuning_results['model']
+            
+            # Evaluate model on test set
+            print("Evaluating final emergency model on test set...")
+            emergency_eval = emergency_model.evaluate(X_test, y_test)
+            emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
+            
+            # Get predictions
+            y_pred_prob = emergency_model.predict(X_test).flatten()
+            
+            # Find optimal threshold
+            from sklearn.metrics import precision_recall_curve, f1_score
+            precision, recall, thresholds = precision_recall_curve(y_test, y_pred_prob)
+            f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
+            best_idx = np.argmax(f1_scores)
+            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+            
+            # Get predictions at optimal threshold
+            y_pred = (y_pred_prob >= best_threshold).astype(int)
+            
+            # Calculate F1 score manually
+            f1 = f1_score(y_test, y_pred)
+            emergency_metrics['f1_score'] = f1
+            
+            # Store results
+            results['emergency_visit'] = {
+                'model': emergency_model,
+                'metrics': emergency_metrics,
+                'y_test': y_test,
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'best_threshold': best_threshold,
+                'selected_features': selected_feature_names,
+                'feature_selection': feature_selection_results,
+                'hyperparameter_tuning': tuning_results
+            }
+            
+            print(f"Emergency visit model optimized with metrics: {emergency_metrics}")
+        
+        # Continue with other models (diagnosis, medication, procedure)...
+        # [Code for other models would follow the same pattern]
+        
+        # Save preprocessing information
+        self.preprocessors['main'] = features['preprocessor']
+        
+        # Update models dictionary
+        for key, value in results.items():
+            if 'model' in value:
+                self.models[key] = value['model']
+        
+        # Save the training results
+        self.save_optimized_models_results(results)
+        
+        return results
+
+    def save_optimized_models_results(self, results, output_dir='optimized_models'):
+        """
+        Save optimized models, their hyperparameters, and performance metrics
+        
+        Args:
+            results: Dictionary with optimized model results
+            output_dir: Directory to save models and metadata
+        """
+        import os
+        import json
+        import joblib
+        from datetime import datetime
+        
+        # Create output directories
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'metadata'), exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save the preprocessing pipeline
+        if 'main' in self.preprocessors:
+            preprocessor_path = os.path.join(output_dir, f'preprocessor_{timestamp}.joblib')
+            joblib.dump(self.preprocessors['main'], preprocessor_path)
+            print(f"Saved preprocessor to {preprocessor_path}")
+        
+        # Save each model and its metadata
+        for model_type, result in results.items():
+            if 'model' not in result:
+                continue
+            
+            # Save TensorFlow model
+            model_path = os.path.join(output_dir, 'models', f"{model_type}_model_{timestamp}.keras")
+            result['model'].save(model_path)
+            
+            # Create metadata object (without large numpy arrays)
+            metadata = {
+                'timestamp': timestamp,
+                'metrics': {k: float(v) for k, v in result.get('metrics', {}).items()},
+                'model_path': model_path,
+                'preprocessor_path': preprocessor_path,
+                'selected_features': result.get('selected_features', [])
+            }
+            
+            # Add hyperparameters if available
+            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
+                metadata['hyperparameters'] = result['hyperparameter_tuning']['best_hyperparameters']
+            
+            # Add model-specific information
+            if model_type == 'emergency_visit' and 'best_threshold' in result:
+                metadata['best_threshold'] = float(result['best_threshold'])
+            
+            if model_type in ['diagnosis', 'medication', 'procedure'] and 'categories' in result:
+                metadata['categories'] = result['categories']
+            
+            # Save metadata to JSON
+            metadata_path = os.path.join(output_dir, 'metadata', f"{model_type}_metadata_{timestamp}.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+            
+            print(f"Saved {model_type} model to {model_path} with metadata")
+        
+        # Generate comparison report of model performance
+        self.create_model_comparison_report(results, timestamp, output_dir)
+        
+        return True
+
+    def create_model_comparison_report(self, results, timestamp, output_dir='optimized_models'):
+        """
+        Create a comprehensive comparison report of model performance with visualizations
+        
+        Args:
+            results: Dictionary with model results
+            timestamp: Timestamp string for file naming
+            output_dir: Base directory to save report
+        """
+        import os
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # Create reports directory
+        reports_dir = os.path.join(output_dir, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        # Extract metrics from all models
+        models_metrics = []
+        
+        for model_type, result in results.items():
+            if 'metrics' not in result:
+                continue
+            
+            # Get metrics
+            metrics = result['metrics']
+            
+            # Add model type
+            metrics_row = {
+                'model_type': model_type,
+                **{k: float(v) for k, v in metrics.items()}
+            }
+            
+            # Add hyperparameter info if available
+            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
+                hp = result['hyperparameter_tuning']['best_hyperparameters']
+                
+                # Add key hyperparameters
+                if 'learning_rate' in hp:
+                    metrics_row['learning_rate'] = hp['learning_rate']
+                
+                if 'units_1' in hp:
+                    metrics_row['hidden_units'] = hp['units_1']
+                
+                if 'dropout_1' in hp:
+                    metrics_row['dropout_rate'] = hp['dropout_1']
+            
+            # Add feature selection info
+            if 'feature_selection' in result:
+                metrics_row['n_features'] = len(result.get('selected_features', []))
+                metrics_row['feature_selection_method'] = result['feature_selection'].get('method', 'unknown')
+            
+            models_metrics.append(metrics_row)
+        
+        if not models_metrics:
+            print("No metrics available for comparison report")
+            return
+        
+        # Create metrics DataFrame
+        metrics_df = pd.DataFrame(models_metrics)
+        
+        # Save metrics to CSV
+        metrics_file = os.path.join(reports_dir, f"model_metrics_comparison_{timestamp}.csv")
+        metrics_df.to_csv(metrics_file, index=False)
+        
+        # Create comparison visualizations
+        
+        # 1. Bar chart of key metrics for each model
+        # Identify metrics common to all models
+        common_metrics = ['accuracy', 'auc', 'precision', 'recall', 'f1_score']
+        available_metrics = [m for m in common_metrics if m in metrics_df.columns]
+        
+        if available_metrics:
+            plt.figure(figsize=(14, 8))
+            metrics_df_melted = pd.melt(
+                metrics_df, 
+                id_vars=['model_type'], 
+                value_vars=available_metrics,
+                var_name='Metric', 
+                value_name='Value'
+            )
+            
+            ax = sns.barplot(x='model_type', y='Value', hue='Metric', data=metrics_df_melted)
+            plt.title('Model Performance Comparison', fontsize=16)
+            plt.xlabel('Model Type', fontsize=14)
+            plt.ylabel('Metric Value', fontsize=14)
+            plt.legend(title='Metric', fontsize=12)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Rotate x-axis labels
+            plt.xticks(rotation=45, ha='right')
+            
+            # Adjust layout
+            plt.tight_layout()
+            
+            # Save figure
+            plt.savefig(os.path.join(reports_dir, f"model_comparison_chart_{timestamp}.png"))
+            plt.close()
+        
+        # 2. Create heatmap of metrics
+        if len(metrics_df) > 1 and len(available_metrics) > 1:
+            # Set model_type as index
+            metrics_heatmap_df = metrics_df.set_index('model_type')[available_metrics]
+            
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(metrics_heatmap_df, annot=True, fmt=".3f", cmap="YlGnBu")
+            plt.title('Model Metrics Heatmap', fontsize=16)
+            plt.tight_layout()
+            plt.savefig(os.path.join(reports_dir, f"metrics_heatmap_{timestamp}.png"))
+            plt.close()
+        
+        # 3. Create ROC curves comparison for binary models (if applicable)
+        binary_models = ['emergency_visit']
+        has_binary_models = any(model in results for model in binary_models)
+        
+        if has_binary_models:
+            from sklearn.metrics import roc_curve, auc
+            
+            plt.figure(figsize=(10, 8))
+            
+            for model_type in binary_models:
+                if model_type in results and 'y_test' in results[model_type] and 'y_pred_prob' in results[model_type]:
+                    result = results[model_type]
+                    y_test = result['y_test']
+                    y_pred_prob = result['y_pred_prob']
+                    
+                    # Calculate ROC curve
+                    fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+                    roc_auc = auc(fpr, tpr)
+                    
+                    # Plot ROC curve
+                    plt.plot(fpr, tpr, lw=2, label=f'{model_type} (AUC = {roc_auc:.3f})')
+            
+            # Add diagonal line (random classifier)
+            plt.plot([0, 1], [0, 1], 'k--', lw=2)
+            
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=14)
+            plt.ylabel('True Positive Rate', fontsize=14)
+            plt.title('ROC Curves Comparison', fontsize=16)
+            plt.legend(loc="lower right", fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(reports_dir, f"roc_curves_comparison_{timestamp}.png"))
+            plt.close()
+        
+        # 4. Create feature importance plots for each model
+        for model_type, result in results.items():
+            if 'feature_selection' not in result or 'selected_features' not in result:
+                continue
+            
+            feature_selection = result['feature_selection']
+            
+            if 'importance_scores' not in feature_selection:
+                continue
+            
+            importance_scores = feature_selection['importance_scores']
+            
+            # Convert to DataFrame
+            importance_df = pd.DataFrame({
+                'Feature': list(importance_scores.keys()),
+                'Importance': list(importance_scores.values())
+            }).sort_values('Importance', ascending=False)
+            
+            # Plot top 20 features
+            n_features = min(20, len(importance_df))
+            plt.figure(figsize=(12, 10))
+            
+            sns.barplot(y='Feature', x='Importance', data=importance_df.head(n_features))
+            plt.title(f'Top {n_features} Important Features for {model_type.replace("_", " ").title()} Model', fontsize=16)
+            plt.xlabel('Importance Score', fontsize=14)
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(reports_dir, f"{model_type}_feature_importance_{timestamp}.png"))
+            plt.close()
+        
+        # 5. Create a hyperparameters comparison table
+        hp_rows = []
+        
+        for model_type, result in results.items():
+            if 'hyperparameter_tuning' not in result or 'best_hyperparameters' not in result['hyperparameter_tuning']:
+                continue
+            
+            hp = result['hyperparameter_tuning']['best_hyperparameters']
+            
+            hp_row = {'model_type': model_type}
+            
+            # Add key hyperparameters
+            for param in ['learning_rate', 'units_1', 'units_2', 'dropout_1', 'dropout_2', 
+                        'activation_1', 'optimizer', 'l2_1', 'batch_norm_1']:
+                if param in hp:
+                    hp_row[param] = hp[param]
+            
+            hp_rows.append(hp_row)
+        
+        if hp_rows:
+            hp_df = pd.DataFrame(hp_rows)
+            hp_file = os.path.join(reports_dir, f"hyperparameters_comparison_{timestamp}.csv")
+            hp_df.to_csv(hp_file, index=False)
+        
+        print(f"Created model comparison report in {reports_dir}")
+
+    def run_optimized_pipeline(self, condition_keywords=None, force_new_timelines=False, append_new_months=True):
+        """
+        Run the optimized ML pipeline for health predictions with hyperparameter tuning
+        
+        Args:
+            condition_keywords: List of keywords to identify target patients
+            force_new_timelines: Whether to force creation of new timelines even if existing data is found
+            append_new_months: Whether to append new months to existing patients
+            
+        Returns:
+            Dictionary with pipeline results or False if pipeline failed
+        """
+        print("Starting optimized health prediction pipeline with hyperparameter tuning")
+        
+        # 1. Load data
+        print("\n=== Loading Data ===")
+        if not self.load_data():
+            print("Failed to load data. Exiting.")
+            return False
+        
+        # 2. Identify target patients
+        print("\n=== Identifying Target Patients ===")
+        target_patient_ids = self.identify_target_patients(condition_keywords)
+        
+        if len(target_patient_ids) == 0:
+            print("No target patients found. Exiting.")
+            return False
+        
+        # 3. Create or update enhanced patient timelines
+        print("\n=== Creating/Updating Enhanced Patient Timelines ===")
+        timeline_df, targets = self.load_or_append_patient_timelines(
+            target_patient_ids, 
+            force_new=force_new_timelines,
+            append_new_months=append_new_months
+        )
+        
+        if len(timeline_df) == 0:
+            print("No timeline data generated. Exiting.")
+            return False
+        
+        # 4. Train optimized prediction models with hyperparameter tuning
+        print("\n=== Training Optimized Prediction Models ===")
+        model_results = self.train_optimized_models(timeline_df, targets)
+        
+        # 5. Generate clinical insights
+        print("\n=== Generating Clinical Insights ===")
+        clinical_insights = self.generate_clinical_insights(model_results)
+        
+        # Save insights to JSON
+        import os
+        import json
+        from datetime import datetime
+        
+        insights_path = os.path.join('optimized_models', f'clinical_insights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        with open(insights_path, 'w') as f:
+            json.dump(clinical_insights, f, indent=2)
+        
+        print(f"Saved clinical insights to {insights_path}")
+        
+        # Display key insights summary
+        print("\n=== Clinical Insights Summary ===")
+        
+        print("\nTop Emergency Risk Factors:")
+        for i, factor in enumerate(clinical_insights['emergency_risk_factors'][:5]):
+            print(f"{i+1}. {factor['factor']} (Importance: {factor['importance']:.4f})")
+        
+        print("\nMost Common Predicted Diagnoses:")
+        for i, diagnosis in enumerate(clinical_insights['common_diagnoses'][:5]):
+            print(f"{i+1}. {diagnosis['diagnosis']} (Probability: {diagnosis['probability']:.4f})")
+        
+        print("\nTop Recommended Medications:")
+        for i, med in enumerate(clinical_insights['recommended_medications'][:5]):
+            print(f"{i+1}. {med['medication']} (Probability: {med['probability']:.4f})")
+        
+        print("\nTop Suggested Procedures:")
+        for i, proc in enumerate(clinical_insights['suggested_procedures'][:5]):
+            print(f"{i+1}. {proc['procedure']} (Probability: {proc['probability']:.4f})")
+        
+        print("\n=== Optimized Pipeline Complete ===")
+        
+        return {
+            'model_results': model_results,
+            'clinical_insights': clinical_insights,
+            'timeline_df': timeline_df
+        }
+    
+    def train_optimized_models(self, timeline_df, targets):
+        """
+        Train prediction models with hyperparameter optimization
+        
+        Args:
+            timeline_df: DataFrame with patient timeline features
+            targets: Dictionary with target arrays for each prediction task
+            
+        Returns:
+            Dictionary with optimized models and their evaluation metrics
+        """
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from sklearn.model_selection import train_test_split
+        
+        # Create output directories
+        os.makedirs('hyperparameter_tuning', exist_ok=True)
+        os.makedirs('feature_selection', exist_ok=True)
+        
+        # Prepare features
+        print("Preparing features for optimized models...")
+        features = self.prepare_features(timeline_df)
+        
+        X = features['X_processed']
+        results = {}
+        
+        # ----------------- EMERGENCY VISIT MODEL -----------------
+        if 'emergency_visit' in targets and len(targets['emergency_visit']) > 0:
+            print("\nOptimizing emergency visit prediction model...")
+            y_emergency = targets['emergency_visit']
+            
+            # Convert to boolean array if needed
+            if y_emergency.dtype != bool and y_emergency.dtype != np.bool_:
+                y_emergency = np.array([bool(val) if val != 'nan' else False for val in y_emergency], dtype=bool)
+            
+            # Perform enhanced feature selection
+            print("Performing enhanced feature selection for emergency model...")
+            feature_selection_results = self.enhanced_feature_selection(
+                X, y_emergency, features['feature_names'], 
+                n_features=30,  # Select top 30 features
+                method='ensemble'  # Use ensemble of methods for better selection
+            )
+            
+            # Use only selected features
+            X_selected = X[:, feature_selection_results['selected_indices']]
+            selected_feature_names = feature_selection_results['selected_features']
+            
+            print(f"Selected {len(selected_feature_names)} features for emergency model")
+            
+            # Split data for model tuning
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, y_emergency, test_size=0.2, random_state=42,
+                stratify=y_emergency  # Ensure balanced splits
+            )
+            
+            # Further split train into train/validation for hyperparameter tuning
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=42,
+                stratify=y_train
+            )
+            
+            # Run hyperparameter tuning
+            print("Running hyperparameter tuning for emergency model...")
+            tuning_results = self.tune_model_hyperparameters(
+                X_train, y_train, X_val, y_val,
+                model_type='binary',
+                tuning_epochs=30,
+                max_trials=20
+            )
+            
+            # Get best model
+            emergency_model = tuning_results['model']
+            
+            # Evaluate model on test set
+            print("Evaluating final emergency model on test set...")
+            emergency_eval = emergency_model.evaluate(X_test, y_test)
+            emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
+            
+            # Get predictions
+            y_pred_prob = emergency_model.predict(X_test).flatten()
+            
+            # Find optimal threshold
+            from sklearn.metrics import precision_recall_curve, f1_score
+            precision, recall, thresholds = precision_recall_curve(y_test, y_pred_prob)
+            f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
+            best_idx = np.argmax(f1_scores)
+            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+            
+            # Get predictions at optimal threshold
+            y_pred = (y_pred_prob >= best_threshold).astype(int)
+            
+            # Calculate F1 score manually
+            f1 = f1_score(y_test, y_pred)
+            emergency_metrics['f1_score'] = f1
+            
+            # Store results
+            results['emergency_visit'] = {
+                'model': emergency_model,
+                'metrics': emergency_metrics,
+                'y_test': y_test,
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'best_threshold': best_threshold,
+                'selected_features': selected_feature_names,
+                'feature_selection': feature_selection_results,
+                'hyperparameter_tuning': tuning_results
+            }
+            
+            print(f"Emergency visit model optimized with metrics: {emergency_metrics}")
+        
+        # ----------------- DIAGNOSIS MODEL -----------------
+        if 'diagnoses' in targets and len(targets['diagnoses']) > 0 and len(self.diagnosis_categories) > 0:
+            print("\nOptimizing diagnosis prediction model...")
+            y_diagnosis = targets['diagnoses']
+            
+            # Perform enhanced feature selection
+            print("Performing enhanced feature selection for diagnosis model...")
+            feature_selection_results = self.enhanced_feature_selection(
+                X, y_diagnosis, features['feature_names'], 
+                n_features=40,  # Select more features for multi-label
+                method='ensemble'
+            )
+            
+            # Use selected features
+            X_selected = X[:, feature_selection_results['selected_indices']]
+            selected_feature_names = feature_selection_results['selected_features']
+            
+            print(f"Selected {len(selected_feature_names)} features for diagnosis model")
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, y_diagnosis, test_size=0.2, random_state=42
+            )
+            
+            # Further split for hyperparameter tuning
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=42
+            )
+            
+            # Run hyperparameter tuning
+            print("Running hyperparameter tuning for diagnosis model...")
+            tuning_results = self.tune_model_hyperparameters(
+                X_train, y_train, X_val, y_val,
+                model_type='multi_label',
+                tuning_epochs=30,
+                max_trials=20
+            )
+            
+            # Get best model
+            diagnosis_model = tuning_results['model']
+            
+            # Evaluate model on test set
+            print("Evaluating final diagnosis model on test set...")
+            diagnosis_eval = diagnosis_model.evaluate(X_test, y_test)
+            diagnosis_metrics = {name: value for name, value in zip(diagnosis_model.metrics_names, diagnosis_eval)}
+            
+            # Get predictions
+            y_pred_prob = diagnosis_model.predict(X_test)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            
+            # Calculate F1 scores manually
+            from sklearn.metrics import f1_score
+            f1_scores = []
+            for i in range(y_test.shape[1]):
+                f1 = f1_score(y_test[:, i], y_pred[:, i])
+                f1_scores.append(f1)
+            
+            # Average F1 score
+            avg_f1 = np.mean(f1_scores)
+            diagnosis_metrics['f1_score'] = avg_f1
+            
+            # Store results
+            results['diagnosis'] = {
+                'model': diagnosis_model,
+                'metrics': diagnosis_metrics,
+                'y_test': y_test,
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'categories': self.diagnosis_categories,
+                'selected_features': selected_feature_names,
+                'feature_selection': feature_selection_results,
+                'hyperparameter_tuning': tuning_results
+            }
+            
+            print(f"Diagnosis model optimized with metrics: {diagnosis_metrics}")
+        
+        # ----------------- MEDICATION MODEL -----------------
+        if 'medications' in targets and len(targets['medications']) > 0 and len(self.medication_categories) > 0:
+            print("\nOptimizing medication prediction model...")
+            y_medication = targets['medications']
+            
+            # Perform enhanced feature selection
+            print("Performing enhanced feature selection for medication model...")
+            feature_selection_results = self.enhanced_feature_selection(
+                X, y_medication, features['feature_names'], 
+                n_features=40,
+                method='ensemble'
+            )
+            
+            # Use selected features
+            X_selected = X[:, feature_selection_results['selected_indices']]
+            selected_feature_names = feature_selection_results['selected_features']
+            
+            print(f"Selected {len(selected_feature_names)} features for medication model")
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, y_medication, test_size=0.2, random_state=42
+            )
+            
+            # Further split for hyperparameter tuning
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=42
+            )
+            
+            # Run hyperparameter tuning
+            print("Running hyperparameter tuning for medication model...")
+            tuning_results = self.tune_model_hyperparameters(
+                X_train, y_train, X_val, y_val,
+                model_type='multi_label',
+                tuning_epochs=30,
+                max_trials=20
+            )
+            
+            # Get best model
+            medication_model = tuning_results['model']
+            
+            # Evaluate model on test set
+            print("Evaluating final medication model on test set...")
+            medication_eval = medication_model.evaluate(X_test, y_test)
+            medication_metrics = {name: value for name, value in zip(medication_model.metrics_names, medication_eval)}
+            
+            # Get predictions
+            y_pred_prob = medication_model.predict(X_test)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            
+            # Calculate F1 scores manually
+            from sklearn.metrics import f1_score
+            f1_scores = []
+            for i in range(y_test.shape[1]):
+                f1 = f1_score(y_test[:, i], y_pred[:, i])
+                f1_scores.append(f1)
+            
+            # Average F1 score
+            avg_f1 = np.mean(f1_scores)
+            medication_metrics['f1_score'] = avg_f1
+            
+            # Store results
+            results['medication'] = {
+                'model': medication_model,
+                'metrics': medication_metrics,
+                'y_test': y_test,
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'categories': self.medication_categories,
+                'selected_features': selected_feature_names,
+                'feature_selection': feature_selection_results,
+                'hyperparameter_tuning': tuning_results
+            }
+            
+            print(f"Medication model optimized with metrics: {medication_metrics}")
+        
+        # ----------------- PROCEDURE MODEL -----------------
+        if 'procedures' in targets and len(targets['procedures']) > 0 and len(self.procedure_categories) > 0:
+            print("\nOptimizing procedure prediction model...")
+            y_procedure = targets['procedures']
+            
+            # Perform enhanced feature selection
+            print("Performing enhanced feature selection for procedure model...")
+            feature_selection_results = self.enhanced_feature_selection(
+                X, y_procedure, features['feature_names'], 
+                n_features=40,
+                method='ensemble'
+            )
+            
+            # Use selected features
+            X_selected = X[:, feature_selection_results['selected_indices']]
+            selected_feature_names = feature_selection_results['selected_features']
+            
+            print(f"Selected {len(selected_feature_names)} features for procedure model")
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, y_procedure, test_size=0.2, random_state=42
+            )
+            
+            # Further split for hyperparameter tuning
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=42
+            )
+            
+            # Run hyperparameter tuning
+            print("Running hyperparameter tuning for procedure model...")
+            tuning_results = self.tune_model_hyperparameters(
+                X_train, y_train, X_val, y_val,
+                model_type='multi_label',
+                tuning_epochs=30,
+                max_trials=20
+            )
+            
+            # Get best model
+            procedure_model = tuning_results['model']
+            
+            # Evaluate model on test set
+            print("Evaluating final procedure model on test set...")
+            procedure_eval = procedure_model.evaluate(X_test, y_test)
+            procedure_metrics = {name: value for name, value in zip(procedure_model.metrics_names, procedure_eval)}
+            
+            # Get predictions
+            y_pred_prob = procedure_model.predict(X_test)
+            y_pred = (y_pred_prob >= 0.5).astype(int)
+            
+            # Calculate F1 scores manually
+            from sklearn.metrics import f1_score
+            f1_scores = []
+            for i in range(y_test.shape[1]):
+                f1 = f1_score(y_test[:, i], y_pred[:, i])
+                f1_scores.append(f1)
+            
+            # Average F1 score
+            avg_f1 = np.mean(f1_scores)
+            procedure_metrics['f1_score'] = avg_f1
+            
+            # Store results
+            results['procedure'] = {
+                'model': procedure_model,
+                'metrics': procedure_metrics,
+                'y_test': y_test,
+                'y_pred': y_pred,
+                'y_pred_prob': y_pred_prob,
+                'categories': self.procedure_categories,
+                'selected_features': selected_feature_names,
+                'feature_selection': feature_selection_results,
+                'hyperparameter_tuning': tuning_results
+            }
+            
+            print(f"Procedure model optimized with metrics: {procedure_metrics}")
+        
+        # Save preprocessing information
+        self.preprocessors['main'] = features['preprocessor']
+        
+        # Update models dictionary
+        for key, value in results.items():
+            if 'model' in value:
+                self.models[key] = value['model']
+        
+        # Save the training results
+        self.save_optimized_models_results(results)
+        
+        return results
+
+    def save_optimized_models_results(self, results, output_dir='optimized_models'):
+        """
+        Save optimized models, their hyperparameters, and performance metrics
+        
+        Args:
+            results: Dictionary with optimized model results
+            output_dir: Directory to save models and metadata
+        """
+        import os
+        import json
+        import joblib
+        from datetime import datetime
+        
+        # Create output directories
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'metadata'), exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save the preprocessing pipeline
+        if 'main' in self.preprocessors:
+            preprocessor_path = os.path.join(output_dir, f'preprocessor_{timestamp}.joblib')
+            joblib.dump(self.preprocessors['main'], preprocessor_path)
+            print(f"Saved preprocessor to {preprocessor_path}")
+        
+        # Save each model and its metadata
+        for model_type, result in results.items():
+            if 'model' not in result:
+                continue
+            
+            # Save TensorFlow model
+            model_path = os.path.join(output_dir, 'models', f"{model_type}_model_{timestamp}.keras")
+            result['model'].save(model_path)
+            
+            # Create metadata object (without large numpy arrays)
+            metadata = {
+                'timestamp': timestamp,
+                'metrics': {k: float(v) for k, v in result.get('metrics', {}).items()},
+                'model_path': model_path,
+                'preprocessor_path': preprocessor_path,
+                'selected_features': result.get('selected_features', [])
+            }
+            
+            # Add hyperparameters if available
+            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
+                metadata['hyperparameters'] = result['hyperparameter_tuning']['best_hyperparameters']
+            
+            # Add model-specific information
+            if model_type == 'emergency_visit' and 'best_threshold' in result:
+                metadata['best_threshold'] = float(result['best_threshold'])
+            
+            if model_type in ['diagnosis', 'medication', 'procedure'] and 'categories' in result:
+                metadata['categories'] = result['categories']
+            
+            # Save metadata to JSON
+            metadata_path = os.path.join(output_dir, 'metadata', f"{model_type}_metadata_{timestamp}.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+            
+            print(f"Saved {model_type} model to {model_path} with metadata")
+        
+        # Generate comparison report of model performance
+        self.create_model_comparison_report(results, timestamp, output_dir)
+        
+        return True
+
+    def create_model_comparison_report(self, results, timestamp, output_dir='optimized_models'):
+        """
+        Create a comprehensive comparison report of model performance with visualizations
+        
+        Args:
+            results: Dictionary with model results
+            timestamp: Timestamp string for file naming
+            output_dir: Base directory to save report
+        """
+        import os
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # Create reports directory
+        reports_dir = os.path.join(output_dir, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        # Extract metrics from all models
+        models_metrics = []
+        
+        for model_type, result in results.items():
+            if 'metrics' not in result:
+                continue
+            
+            # Get metrics
+            metrics = result['metrics']
+            
+            # Add model type
+            metrics_row = {
+                'model_type': model_type,
+                **{k: float(v) for k, v in metrics.items()}
+            }
+            
+            # Add hyperparameter info if available
+            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
+                hp = result['hyperparameter_tuning']['best_hyperparameters']
+                
+                # Add key hyperparameters
+                if 'learning_rate' in hp:
+                    metrics_row['learning_rate'] = hp['learning_rate']
+                
+                if 'units_1' in hp:
+                    metrics_row['hidden_units'] = hp['units_1']
+                
+                if 'dropout_1' in hp:
+                    metrics_row['dropout_rate'] = hp['dropout_1']
+            
+            # Add feature selection info
+            if 'feature_selection' in result:
+                metrics_row['n_features'] = len(result.get('selected_features', []))
+                metrics_row['feature_selection_method'] = result['feature_selection'].get('method', 'unknown')
+            
+            models_metrics.append(metrics_row)
+        
+        if not models_metrics:
+            print("No metrics available for comparison report")
+            return
+        
+        # Create metrics DataFrame
+        metrics_df = pd.DataFrame(models_metrics)
+        
+        # Save metrics to CSV
+        metrics_file = os.path.join(reports_dir, f"model_metrics_comparison_{timestamp}.csv")
+        metrics_df.to_csv(metrics_file, index=False)
+        
+        # Create comparison visualizations
+        
+        # 1. Bar chart of key metrics for each model
+        # Identify metrics common to all models
+        common_metrics = ['accuracy', 'auc', 'precision', 'recall', 'f1_score']
+        available_metrics = [m for m in common_metrics if m in metrics_df.columns]
+        
+        if available_metrics:
+            plt.figure(figsize=(14, 8))
+            metrics_df_melted = pd.melt(
+                metrics_df, 
+                id_vars=['model_type'], 
+                value_vars=available_metrics,
+                var_name='Metric', 
+                value_name='Value'
+            )
+            
+            ax = sns.barplot(x='model_type', y='Value', hue='Metric', data=metrics_df_melted)
+            plt.title('Model Performance Comparison', fontsize=16)
+            plt.xlabel('Model Type', fontsize=14)
+            plt.ylabel('Metric Value', fontsize=14)
+            plt.legend(title='Metric', fontsize=12)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Rotate x-axis labels
+            plt.xticks(rotation=45, ha='right')
+            
+            # Adjust layout
+            plt.tight_layout()
+            
+            # Save figure
+            plt.savefig(os.path.join(reports_dir, f"model_comparison_chart_{timestamp}.png"))
+            plt.close()
+        
+        # 2. Create heatmap of metrics
+        if len(metrics_df) > 1 and len(available_metrics) > 1:
+            # Set model_type as index
+            metrics_heatmap_df = metrics_df.set_index('model_type')[available_metrics]
+            
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(metrics_heatmap_df, annot=True, fmt=".3f", cmap="YlGnBu")
+            plt.title('Model Metrics Heatmap', fontsize=16)
+            plt.tight_layout()
+            plt.savefig(os.path.join(reports_dir, f"metrics_heatmap_{timestamp}.png"))
+            plt.close()
+        
+        # 3. Create ROC curves comparison for binary models (if applicable)
+        binary_models = ['emergency_visit']
+        has_binary_models = any(model in results for model in binary_models)
+        
+        if has_binary_models:
+            from sklearn.metrics import roc_curve, auc
+            
+            plt.figure(figsize=(10, 8))
+            
+            for model_type in binary_models:
+                if model_type in results and 'y_test' in results[model_type] and 'y_pred_prob' in results[model_type]:
+                    result = results[model_type]
+                    y_test = result['y_test']
+                    y_pred_prob = result['y_pred_prob']
+                    
+                    # Calculate ROC curve
+                    fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+                    roc_auc = auc(fpr, tpr)
+                    
+                    # Plot ROC curve
+                    plt.plot(fpr, tpr, lw=2, label=f'{model_type} (AUC = {roc_auc:.3f})')
+            
+            # Add diagonal line (random classifier)
+            plt.plot([0, 1], [0, 1], 'k--', lw=2)
+            
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=14)
+            plt.ylabel('True Positive Rate', fontsize=14)
+            plt.title('ROC Curves Comparison', fontsize=16)
+            plt.legend(loc="lower right", fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(reports_dir, f"roc_curves_comparison_{timestamp}.png"))
+            plt.close()
+        
+        # 4. Create feature importance plots for each model
+        for model_type, result in results.items():
+            if 'feature_selection' not in result or 'selected_features' not in result:
+                continue
+            
+            feature_selection = result['feature_selection']
+            
+            if 'importance_scores' not in feature_selection:
+                continue
+            
+            importance_scores = feature_selection['importance_scores']
+            
+            # Convert to DataFrame
+            importance_df = pd.DataFrame({
+                'Feature': list(importance_scores.keys()),
+                'Importance': list(importance_scores.values())
+            }).sort_values('Importance', ascending=False)
+            
+            # Plot top 20 features
+            n_features = min(20, len(importance_df))
+            plt.figure(figsize=(12, 10))
+            
+            sns.barplot(y='Feature', x='Importance', data=importance_df.head(n_features))
+            plt.title(f'Top {n_features} Important Features for {model_type.replace("_", " ").title()} Model', fontsize=16)
+            plt.xlabel('Importance Score', fontsize=14)
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(reports_dir, f"{model_type}_feature_importance_{timestamp}.png"))
+            plt.close()
+        
+        # 5. Create a hyperparameters comparison table
+        hp_rows = []
+        
+        for model_type, result in results.items():
+            if 'hyperparameter_tuning' not in result or 'best_hyperparameters' not in result['hyperparameter_tuning']:
+                continue
+            
+            hp = result['hyperparameter_tuning']['best_hyperparameters']
+            
+            hp_row = {'model_type': model_type}
+            
+            # Add key hyperparameters
+            for param in ['learning_rate', 'units_1', 'units_2', 'dropout_1', 'dropout_2', 
+                        'activation_1', 'optimizer', 'l2_1', 'batch_norm_1']:
+                if param in hp:
+                    hp_row[param] = hp[param]
+            
+            hp_rows.append(hp_row)
+        
+        if hp_rows:
+            hp_df = pd.DataFrame(hp_rows)
+            hp_file = os.path.join(reports_dir, f"hyperparameters_comparison_{timestamp}.csv")
+            hp_df.to_csv(hp_file, index=False)
+        
+        print(f"Created model comparison report in {reports_dir}")
+
+    def run_optimized_pipeline(self, condition_keywords=None, force_new_timelines=False, append_new_months=True):
+        """
+        Run the optimized ML pipeline for health predictions with hyperparameter tuning
+        
+        Args:
+            condition_keywords: List of keywords to identify target patients
+            force_new_timelines: Whether to force creation of new timelines even if existing data is found
+            append_new_months: Whether to append new months to existing patients
+            
+        Returns:
+            Dictionary with pipeline results or False if pipeline failed
+        """
+        print("Starting optimized health prediction pipeline with hyperparameter tuning")
+        
+        # 1. Load data
+        print("\n=== Loading Data ===")
+        if not self.load_data():
+            print("Failed to load data. Exiting.")
+            return False
+        
+        # 2. Identify target patients
+        print("\n=== Identifying Target Patients ===")
+        target_patient_ids = self.identify_target_patients(condition_keywords)
+        
+        if len(target_patient_ids) == 0:
+            print("No target patients found. Exiting.")
+            return False
+        
+        # 3. Create or update enhanced patient timelines
+        print("\n=== Creating/Updating Enhanced Patient Timelines ===")
+        timeline_df, targets = self.load_or_append_patient_timelines(
+            target_patient_ids, 
+            force_new=force_new_timelines,
+            append_new_months=append_new_months
+        )
+        
+        if len(timeline_df) == 0:
+            print("No timeline data generated. Exiting.")
+            return False
+        
+        # 4. Train optimized prediction models with hyperparameter tuning
+        print("\n=== Training Optimized Prediction Models ===")
+        model_results = self.train_optimized_models(timeline_df, targets)
+        
+        # 5. Generate clinical insights
+        print("\n=== Generating Clinical Insights ===")
+        clinical_insights = self.generate_clinical_insights(model_results)
+        
+        # Save insights to JSON
+        import os
+        import json
+        from datetime import datetime
+        
+        insights_path = os.path.join('optimized_models', f'clinical_insights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        with open(insights_path, 'w') as f:
+            json.dump(clinical_insights, f, indent=2)
+        
+        print(f"Saved clinical insights to {insights_path}")
+        
+        # Display key insights summary
+        print("\n=== Clinical Insights Summary ===")
+        
+        print("\nTop Emergency Risk Factors:")
+        for i, factor in enumerate(clinical_insights['emergency_risk_factors'][:5]):
+            print(f"{i+1}. {factor['factor']} (Importance: {factor['importance']:.4f})")
+        
+        print("\nMost Common Predicted Diagnoses:")
+        for i, diagnosis in enumerate(clinical_insights['common_diagnoses'][:5]):
+            print(f"{i+1}. {diagnosis['diagnosis']} (Probability: {diagnosis['probability']:.4f})")
+        
+        print("\nTop Recommended Medications:")
+        for i, med in enumerate(clinical_insights['recommended_medications'][:5]):
+            print(f"{i+1}. {med['medication']} (Probability: {med['probability']:.4f})")
+        
+        print("\nTop Suggested Procedures:")
+        for i, proc in enumerate(clinical_insights['suggested_procedures'][:5]):
+            print(f"{i+1}. {proc['procedure']} (Probability: {proc['probability']:.4f})")
+        
+        print("\n=== Optimized Pipeline Complete ===")
+        
+        return {
+            'model_results': model_results,
+            'clinical_insights': clinical_insights,
+            'timeline_df': timeline_df
+        }
+        
+    def tune_model_hyperparameters(self, X_train, y_train, X_val, y_val, model_type='binary', 
+                                tuning_epochs=30, search_epochs=5, max_trials=20):
+        """
+        Use Keras Tuner to optimize hyperparameters for the prediction model
+        
+        Args:
+            X_train: Training feature matrix
+            y_train: Training target variable
+            X_val: Validation feature matrix
+            y_val: Validation target variable
+            model_type: Type of model ('binary' for emergency visit prediction or 'multi_label' for others)
+            tuning_epochs: Number of epochs to train each trial model
+            search_epochs: Number of epochs for final training with best hyperparameters
+            max_trials: Maximum number of different hyperparameter combinations to try
+            
+        Returns:
+            Optimized model and hyperparameter search results
+        """
+        input_shape = X_train.shape[1]  # Number of features
+        
+        # For multi-label models, get the number of output classes
+        num_classes = 1 if model_type == 'binary' else y_train.shape[1]
+        
+        # Define model-building function for Keras Tuner
+        def build_model(hp):
+            model = keras.Sequential()
+            
+            # Input layer
+            model.add(keras.layers.Input(shape=(input_shape,)))
+            
+            # First hidden layer - tune number of units, activation function and regularization
+            model.add(keras.layers.Dense(
+                units=hp.Int('units_1', min_value=32, max_value=512, step=32),
+                activation=hp.Choice('activation_1', values=['relu', 'selu', 'elu', 'tanh']),
+                kernel_regularizer=keras.regularizers.l2(
+                    hp.Float('l2_1', min_value=1e-4, max_value=1e-2, sampling='log')
+                )
+            ))
+            
+            # Add BatchNormalization with optional momentum
+            use_batch_norm = hp.Boolean('batch_norm_1')
+            if use_batch_norm:
+                model.add(keras.layers.BatchNormalization(
+                    momentum=hp.Float('bn_momentum_1', min_value=0.7, max_value=0.99, default=0.9)
+                ))
+            
+            # Add Dropout with tunable rate
+            model.add(keras.layers.Dropout(
+                rate=hp.Float('dropout_1', min_value=0.1, max_value=0.6, step=0.1)
+            ))
+            
+            # Optional second hidden layer
+            if hp.Boolean('second_layer'):
+                model.add(keras.layers.Dense(
+                    units=hp.Int('units_2', min_value=16, max_value=256, step=16),
+                    activation=hp.Choice('activation_2', values=['relu', 'selu', 'elu', 'tanh']),
+                    kernel_regularizer=keras.regularizers.l2(
+                        hp.Float('l2_2', min_value=1e-4, max_value=1e-2, sampling='log')
+                    )
+                ))
+                
+                # Optional batch normalization for second layer
+                if hp.Boolean('batch_norm_2'):
+                    model.add(keras.layers.BatchNormalization(
+                        momentum=hp.Float('bn_momentum_2', min_value=0.7, max_value=0.99, default=0.9)
+                    ))
+                
+                model.add(keras.layers.Dropout(
+                    rate=hp.Float('dropout_2', min_value=0.1, max_value=0.5, step=0.1)
+                ))
+            
+            # Optional third hidden layer
+            if hp.Boolean('third_layer'):
+                model.add(keras.layers.Dense(
+                    units=hp.Int('units_3', min_value=8, max_value=128, step=8),
+                    activation=hp.Choice('activation_3', values=['relu', 'selu', 'elu', 'tanh']),
+                    kernel_regularizer=keras.regularizers.l2(
+                        hp.Float('l2_3', min_value=1e-4, max_value=1e-2, sampling='log')
+                    )
+                ))
+                
+                model.add(keras.layers.Dropout(
+                    rate=hp.Float('dropout_3', min_value=0.1, max_value=0.4, step=0.1)
+                ))
+            
+            # Output layer
+            if model_type == 'binary':
+                model.add(keras.layers.Dense(1, activation='sigmoid'))
+            else:
+                model.add(keras.layers.Dense(num_classes, activation='sigmoid'))  # multi-label
+            
+            # Tune learning rate for optimizer
+            learning_rate = hp.Float('learning_rate', min_value=1e-4, max_value=1e-2, sampling='log')
+            
+            # Choose optimizer
+            optimizer_choice = hp.Choice('optimizer', values=['adam', 'adamw', 'rmsprop'])
+            if optimizer_choice == 'adam':
+                optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+            elif optimizer_choice == 'adamw':
+                optimizer = keras.optimizers.AdamW(
+                    learning_rate=learning_rate,
+                    weight_decay=hp.Float('weight_decay', min_value=1e-5, max_value=1e-3, sampling='log')
+                )
+            else:  # rmsprop
+                optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
+            
+            # Define metrics based on model type
+            metrics = [
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.AUC(name='auc'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall')
+            ]
+            
+            # Compile model
+            model.compile(
+                optimizer=optimizer,
+                loss='binary_crossentropy',
+                metrics=metrics
+            )
+            
+            return model
+        
+        # Create instance of the tuner
+        tuner = kt.Hyperband(
+            build_model,
+            objective=kt.Objective('val_auc', direction='max'),
+            max_epochs=tuning_epochs,
+            factor=3,
+            directory='hyperparameter_tuning',
+            project_name=f'clinical_prediction_{model_type}',
+            overwrite=True
+        )
+        
+        # Define early stopping callback for the search
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            restore_best_weights=True
+        )
+        
+        # Print search space summary
+        tuner.search_space_summary()
+        
+        # Prepare sample weights if dealing with imbalanced data
+        if model_type == 'binary':
+            # Class weights for binary imbalanced problems
+            if len(np.unique(y_train)) <= 2:  # Binary classification
+                pos_count = np.sum(y_train)
+                neg_count = len(y_train) - pos_count
+                
+                if pos_count > 0 and neg_count > 0:
+                    # Calculate class weights
+                    weight_ratio = neg_count / pos_count
+                    class_weight = {0: 1.0, 1: min(5.0, weight_ratio)}  # Cap at 5x to prevent extreme weights
+                    print(f"Using class weights: {class_weight}")
+                    
+                    # Search with class weights
+                    tuner.search(
+                        X_train, y_train,
+                        validation_data=(X_val, y_val),
+                        epochs=tuning_epochs,
+                        callbacks=[early_stopping],
+                        class_weight=class_weight,
+                        verbose=1
+                    )
+                else:
+                    # Handle edge case where one class has zero examples
+                    print("Warning: One class has zero examples. Proceeding without class weights.")
+                    tuner.search(
+                        X_train, y_train, 
+                        validation_data=(X_val, y_val),
+                        epochs=tuning_epochs,
+                        callbacks=[early_stopping],
+                        verbose=1
+                    )
+            else:
+                # Not a binary problem, proceed without class weights
+                tuner.search(
+                    X_train, y_train, 
+                    validation_data=(X_val, y_val),
+                    epochs=tuning_epochs,
+                    callbacks=[early_stopping],
+                    verbose=1
+                )
+        else:
+            # For multi-label, use sample weighting
+            sample_weights = np.ones(len(y_train))
+            
+            # Increase weight for samples with at least one positive label
+            pos_samples = np.sum(y_train, axis=1) > 0
+            sample_weights[pos_samples] = 3.0
+            
+            tuner.search(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=tuning_epochs,
+                callbacks=[early_stopping],
+                sample_weight=sample_weights,
+                verbose=1
+            )
+        
+        # Get best hyperparameters
+        best_hp = tuner.get_best_hyperparameters(1)[0]
+        print("Best hyperparameters:")
+        for param, value in best_hp.values.items():
+            print(f"{param}: {value}")
+        
+        # Build model with best hyperparameters
+        best_model = build_model(best_hp)
+        
+        # Train final model with best hyperparameters
+        if model_type == 'binary' and len(np.unique(y_train)) <= 2:
+            pos_count = np.sum(y_train)
+            neg_count = len(y_train) - pos_count
+            
+            if pos_count > 0 and neg_count > 0:
+                weight_ratio = neg_count / pos_count
+                class_weight = {0: 1.0, 1: min(5.0, weight_ratio)}
+                
+                history = best_model.fit(
+                    X_train, y_train,
+                    validation_data=(X_val, y_val),
+                    epochs=search_epochs,
+                    callbacks=[early_stopping],
+                    class_weight=class_weight,
+                    verbose=1
+                )
+            else:
+                history = best_model.fit(
+                    X_train, y_train,
+                    validation_data=(X_val, y_val),
+                    epochs=search_epochs,
+                    callbacks=[early_stopping],
+                    verbose=1
+                )
+        else:
+            # For multi-label, use sample weighting
+            sample_weights = np.ones(len(y_train))
+            pos_samples = np.sum(y_train, axis=1) > 0
+            sample_weights[pos_samples] = 3.0
+            
+            history = best_model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=search_epochs,
+                callbacks=[early_stopping],
+                sample_weight=sample_weights,
+                verbose=1
+            )
+        
+        # Evaluate final model
+        eval_results = best_model.evaluate(X_val, y_val)
+        metrics = {name: value for name, value in zip(best_model.metrics_names, eval_results)}
+        
+        print("Final model evaluation:")
+        for metric, value in metrics.items():
+            print(f"{metric}: {value:.4f}")
+        
+        # Plot training history
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['loss'], label='Train Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.title('Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['auc'], label='Train AUC')
+        plt.plot(history.history['val_auc'], label='Validation AUC')
+        plt.title('AUC')
+        plt.xlabel('Epoch')
+        plt.ylabel('AUC')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'hyperparameter_tuning/final_model_{model_type}_training.png')
+        plt.close()
+        
+        return {
+            'model': best_model,
+            'best_hyperparameters': best_hp.values,
+            'metrics': metrics,
+            'history': history.history,
+            'tuner': tuner
+        }
+
+
+    def enhanced_feature_selection(self, X, y, feature_names, n_features=50, method='ensemble', 
+                                n_folds=5, plot_results=True):
+        """
+        Perform enhanced feature selection using multiple advanced methods
+        
+        Args:
+            X: Input features
+            y: Target values
+            feature_names: List of feature names
+            n_features: Target number of features to select
+            method: Selection method ('ensemble', 'rfe', 'boruta', 'shap', 'mutual_info')
+            n_folds: Number of cross-validation folds for ensemble method
+            plot_results: Whether to create visualization of selected features
+            
+        Returns:
+            Dictionary with selected feature indices, names, and importance scores
+        """
+        import os
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+        from sklearn.feature_selection import mutual_info_classif, f_classif
+
+        print(f"Performing enhanced feature selection using {method} method...")
+        
+        # Verify dimensions of inputs
+        print(f"X shape: {X.shape}, feature_names length: {len(feature_names)}")
+        
+        # Handle mismatched feature names
+        if len(feature_names) != X.shape[1]:
+            print(f"WARNING: Number of feature names ({len(feature_names)}) does not match X shape ({X.shape[1]})")
+            print("Adjusting feature names to match X dimensions")
+            if len(feature_names) > X.shape[1]:
+                # Truncate feature names if there are too many
+                feature_names = feature_names[:X.shape[1]]
+            else:
+                # Add generic names if there are too few
+                additional_names = [f"feature_{i}" for i in range(len(feature_names), X.shape[1])]
+                feature_names = list(feature_names) + additional_names
+        
+        # For multi-label targets, create a binary target for feature selection
+        if len(y.shape) > 1 and y.shape[1] > 1:
+            # Create a binary target based on whether any positive class exists
+            target = np.any(y == 1, axis=1).astype(int)
+        else:
+            # If already 1D, ensure it's flattened
+            target = y.flatten() if len(y.shape) > 1 else y
+        
+        # Initialize results dictionary
+        results = {
+            'selected_indices': [],
+            'selected_features': [],
+            'importance_scores': {},
+            'method': method
+        }
+        
+        # Create a DataFrame for feature importance visualization
+        features_df = pd.DataFrame({'Feature': feature_names})
+        
+        if method == 'ensemble':
+            # Ensemble method: combine multiple feature selection techniques
+            print("Using ensemble feature selection approach...")
+            
+            importance_methods = {
+                'random_forest': None,
+                'gradient_boosting': None,
+                'mutual_info': None,
+                'anova_f': None,
+                'lasso': None
+            }
+            
+            # 1. Random Forest importance
+            rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+            rf.fit(X, target)
+            importance_methods['random_forest'] = rf.feature_importances_
+            features_df['RF_Importance'] = rf.feature_importances_
+            
+            # 2. Gradient Boosting importance
+            try:
+                gb = GradientBoostingClassifier(n_estimators=100, random_state=42)
+                gb.fit(X, target)
+                importance_methods['gradient_boosting'] = gb.feature_importances_
+                features_df['GB_Importance'] = gb.feature_importances_
+            except Exception as e:
+                print(f"Warning: Gradient Boosting failed: {e}")
+                importance_methods['gradient_boosting'] = np.zeros(X.shape[1])
+                features_df['GB_Importance'] = np.zeros(X.shape[1])
+            
+            # 3. Mutual Information
+            try:
+                mi_scores = mutual_info_classif(X, target, random_state=42)
+                importance_methods['mutual_info'] = mi_scores
+                features_df['MI_Score'] = mi_scores
+            except Exception as e:
+                print(f"Warning: Mutual Information failed: {e}")
+                importance_methods['mutual_info'] = np.zeros(X.shape[1])
+                features_df['MI_Score'] = np.zeros(X.shape[1])
+            
+            # 4. ANOVA F-value
+            try:
+                f_scores, _ = f_classif(X, target)
+                # Replace inf and NaN with 0
+                f_scores = np.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
+                # Normalize to 0-1 scale
+                if np.max(f_scores) > 0:
+                    f_scores = f_scores / np.max(f_scores)
+                importance_methods['anova_f'] = f_scores
+                features_df['F_Score'] = f_scores
+            except Exception as e:
+                print(f"Warning: ANOVA F-value failed: {e}")
+                importance_methods['anova_f'] = np.zeros(X.shape[1])
+                features_df['F_Score'] = np.zeros(X.shape[1])
+            
+            # 5. Lasso feature selection with cross-validation
+            # (Handles multicollinearity better than univariate methods)
+            lasso_importance = np.zeros(X.shape[1])
+            
+            if X.shape[0] > 10:  # Only run if we have enough samples
+                try:
+                    from sklearn.linear_model import LassoCV
+                    
+                    # Normalize X for Lasso
+                    X_scaled = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+                    X_scaled = np.nan_to_num(X_scaled)  # Replace NaNs
+                    
+                    # Run LassoCV to find optimal alpha
+                    lasso = LassoCV(cv=min(5, n_folds), random_state=42, max_iter=10000)
+                    lasso.fit(X_scaled, target)
+                    
+                    # Get coefficient importances
+                    lasso_importance = np.abs(lasso.coef_)
+                    
+                    # Normalize to 0-1 scale
+                    if np.max(lasso_importance) > 0:
+                        lasso_importance = lasso_importance / np.max(lasso_importance)
+                except Exception as e:
+                    print(f"Warning: Lasso feature selection failed: {e}")
+                    # Fill with zeros if it fails
+                    lasso_importance = np.zeros(X.shape[1])
+            
+            importance_methods['lasso'] = lasso_importance
+            features_df['Lasso_Importance'] = lasso_importance
+            
+            # Calculate aggregated importance scores
+            # Normalize each method's scores to 0-1 scale and then combine
+            ensemble_importance = np.zeros(X.shape[1])
+            
+            for method_name, importance in importance_methods.items():
+                if importance is not None:
+                    # Ensure all values are positive and normalized
+                    normalized_importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.max(normalized_importance) > 0:
+                        normalized_importance = normalized_importance / np.max(normalized_importance)
+                    ensemble_importance += normalized_importance
+            
+            # Normalize the ensemble importance
+            if np.max(ensemble_importance) > 0:
+                ensemble_importance = ensemble_importance / np.max(ensemble_importance)
+            
+            # Add ensemble score to DataFrame
+            features_df['Ensemble_Score'] = ensemble_importance
+            
+            # Sort by ensemble importance
+            feature_ranking = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': ensemble_importance
+            }).sort_values('Importance', ascending=False)
+            
+            # Select top n_features
+            selected_features = feature_ranking.head(n_features)
+            selected_indices = [list(feature_names).index(feat) for feat in selected_features['Feature']]
+            
+            # Store in results
+            results['selected_indices'] = selected_indices
+            results['selected_features'] = selected_features['Feature'].tolist()
+            results['importance_scores'] = dict(zip(selected_features['Feature'], selected_features['Importance']))
+            results['all_features_df'] = features_df
+            
+        else:
+            # Default to Random Forest importance
+            print(f"Using Random Forest importance...")
+            
+            rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+            rf.fit(X, target)
+            
+            # Get feature importances
+            importances = rf.feature_importances_
+            
+            # Create a dataframe of features and importances
+            feature_importance = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': importances
+            })
+            
+            # Sort by importance
+            feature_importance = feature_importance.sort_values('Importance', ascending=False)
+            
+            # Select top n features
+            selected_features = feature_importance.head(n_features)
+            
+            # Get indices of selected features
+            selected_indices = [list(feature_names).index(feat) for feat in selected_features['Feature']]
+            
+            features_df['RF_Importance'] = importances
+            
+            # Store results
+            results['selected_indices'] = selected_indices
+            results['selected_features'] = selected_features['Feature'].tolist()
+            results['importance_scores'] = dict(zip(selected_features['Feature'], 
+                                                selected_features['Importance']))
+            results['all_features_df'] = features_df
+        
+        # Verify results integrity
+        if not results['selected_indices'] or len(results['selected_indices']) == 0:
+            print("WARNING: No features were selected. Using top features by default.")
+            # Default to top features by index
+            results['selected_indices'] = list(range(min(n_features, X.shape[1])))
+            results['selected_features'] = [feature_names[i] for i in results['selected_indices']]
+            default_importance = np.ones(len(results['selected_indices']))
+            results['importance_scores'] = dict(zip(results['selected_features'], default_importance))
+        
+        # Plot feature importances
+        if plot_results:
+            # Create directory for plots
+            os.makedirs('feature_selection', exist_ok=True)
+            
+            # Get top 30 features or all if less than 30
+            n_to_plot = min(30, len(results['selected_features']))
+            
+            # Sort features by importance
+            plot_df = pd.DataFrame({
+                'Feature': results['selected_features'],
+                'Importance': list(results['importance_scores'].values())
+            }).sort_values('Importance', ascending=False).head(n_to_plot)
+            
+            # Create horizontal bar plot
+            plt.figure(figsize=(12, max(6, n_to_plot * 0.3)))
+            ax = sns.barplot(x='Importance', y='Feature', data=plot_df)
+            
+            # Add value labels
+            for i, v in enumerate(plot_df['Importance']):
+                ax.text(v + 0.001, i, f"{v:.4f}", va='center')
+            
+            plt.title(f'Top {n_to_plot} Features Selected by {method.replace("_", " ").title()} Method')
+            plt.xlabel('Importance Score')
+            plt.tight_layout()
+            plt.savefig(f'feature_selection/{method}_importance.png')
+            plt.close()
+        
+        print(f"Selected {len(results['selected_indices'])} features with {method} method")
+        print(f"Top 10 selected features:")
+        
+        # Print top features and their importance scores
+        for i, feature in enumerate(results['selected_features'][:10]):
+            importance = results['importance_scores'][feature]
+            print(f"{i+1}. {feature} (Importance: {importance:.6f})")
+        
+        return results
+
+    def feature_stability_analysis(self, X, y, feature_names, method='ensemble', 
+                                n_features=50, n_runs=10, sampling_fraction=0.8):
+        """
+        Assess feature selection stability with bootstrapping to identify consistently important features
+        
+        Args:
+            X: Input features
+            y: Target values
+            feature_names: List of feature names
+            method: Selection method ('ensemble', 'rfe', 'boruta', 'shap', 'mutual_info')
+            n_features: Target number of features to select
+            n_runs: Number of bootstrap iterations
+            sampling_fraction: Fraction of data to sample in each run
+            
+        Returns:
+            Dictionary with stability analysis results
+        """
+        print(f"Performing feature stability analysis with {n_runs} iterations...")
+        
+        # Initialize results
+        stability_results = {
+            'feature_counts': {name: 0 for name in feature_names},
+            'feature_ranks': {name: [] for name in feature_names},
+            'selection_probability': {},
+            'stability_score': 0.0,
+            'consistently_selected': [],
+            'run_results': []
+        }
+        
+        # Prepare target for feature selection
+        if len(y.shape) > 1 and y.shape[1] > 1:
+            # Create a binary target for feature selection
+            target = np.any(y == 1, axis=1).astype(int)
+        else:
+            target = y.flatten() if len(y.shape) > 1 else y
+        
+        # Perform multiple feature selection runs with bootstrapping
+        for run in range(n_runs):
+            print(f"Run {run+1}/{n_runs}...")
+            
+            # Create bootstrap sample
+            n_samples = int(X.shape[0] * sampling_fraction)
+            bootstrap_indices = np.random.choice(X.shape[0], n_samples, replace=True)
+            X_boot = X[bootstrap_indices]
+            y_boot = target[bootstrap_indices]
+            
+            # Perform feature selection
+            selection_result = self.enhanced_feature_selection(
+                X_boot, y_boot, feature_names, 
+                n_features=n_features, method=method,
+                plot_results=False
+            )
+            
+            # Store results from this run
+            stability_results['run_results'].append({
+                'selected_features': selection_result['selected_features'],
+                'selected_indices': selection_result['selected_indices'],
+                'importance_scores': selection_result['importance_scores']
+            })
+            
+            # Update feature counts and ranks
+            for i, feature in enumerate(selection_result['selected_features']):
+                stability_results['feature_counts'][feature] += 1
+                stability_results['feature_ranks'][feature].append(i)
+        
+        # Calculate selection probability for each feature
+        for feature, count in stability_results['feature_counts'].items():
+            stability_results['selection_probability'][feature] = count / n_runs
+        
+        # Identify consistently selected features (selected in at least 70% of runs)
+        consistently_selected = []
+        for feature, prob in stability_results['selection_probability'].items():
+            if prob >= 0.7:  # At least 70% selection rate
+                consistently_selected.append((feature, prob))
+        
+        # Sort by selection probability
+        consistently_selected.sort(key=lambda x: x[1], reverse=True)
+        stability_results['consistently_selected'] = consistently_selected
+        
+        # Calculate stability score (average Jaccard similarity between feature sets)
+        jaccard_sums = 0
+        comparison_count = 0
+        
+        for i in range(n_runs):
+            for j in range(i+1, n_runs):
+                set_i = set(stability_results['run_results'][i]['selected_features'])
+                set_j = set(stability_results['run_results'][j]['selected_features'])
+                
+                # Calculate Jaccard similarity: |intersection| / |union|
+                intersection = len(set_i.intersection(set_j))
+                union = len(set_i.union(set_j))
+                
+                if union > 0:
+                    jaccard_sums += intersection / union
+                    comparison_count += 1
+        
+        # Average Jaccard similarity
+        if comparison_count > 0:
+            stability_results['stability_score'] = jaccard_sums / comparison_count
+        
+        # Create visualization of feature stability
+        plt.figure(figsize=(12, 8))
+        
+        # Get data for top 30 most frequently selected features
+        top_features = sorted(
+            [(f, stability_results['selection_probability'][f]) for f in feature_names],
+            key=lambda x: x[1], 
+            reverse=True
+        )[:30]
+        
+        # Plot selection probability
+        feature_names_for_plot = [f[0] for f in top_features]
+        probabilities = [f[1] for f in top_features]
+        
+        ax = sns.barplot(y=feature_names_for_plot, x=probabilities, palette='viridis')
+        
+        # Add value labels
+        for i, v in enumerate(probabilities):
+            ax.text(v + 0.02, i, f"{v:.2f}", va='center')
+        
+        # Add a vertical line at 0.7 threshold
+        plt.axvline(x=0.7, color='red', linestyle='--', label='Stability Threshold (70%)')
+        
+        plt.title(f'Feature Selection Stability Analysis ({n_runs} runs, {method} method)')
+        plt.xlabel('Selection Probability')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f'feature_selection/stability_analysis_{method}.png')
+        plt.close()
+        
+        # Print stability results
+        print("\nFeature Stability Analysis Results:")
+        print(f"Stability Score (avg Jaccard similarity): {stability_results['stability_score']:.4f}")
+        print(f"\nConsistently Selected Features (≥70% of runs):")
+        
+        for i, (feature, prob) in enumerate(consistently_selected[:20]):  # Show top 20
+            avg_rank = np.mean(stability_results['feature_ranks'][feature]) if stability_results['feature_ranks'][feature] else np.nan
+            print(f"{i+1}. {feature}: {prob*100:.1f}% (avg rank: {avg_rank:.1f})")
+        
+        return stability_results

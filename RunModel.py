@@ -50,7 +50,9 @@ def main():
     if MODE == 'train':
         # Run the ML pipeline for initial training
         print("\n======== INITIAL MODEL TRAINING ========")
-        pipeline_results = predictor.run_pipeline(force_new_timelines=FORCE_NEW_TIMELINES)
+
+
+        pipeline_results = predictor.run_optimized_pipeline()
         
         if not pipeline_results:
             print("Pipeline failed to complete successfully.")
