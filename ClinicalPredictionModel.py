@@ -2577,6 +2577,7 @@ class ClinicalPredictionModel:
         # Counter for processed records
         processed_records = 0
         
+        new_patients = False #TEMPORARY TO PREVENT NEW DATA, REMOVE FOR FINAL
         # Process new patients first
         if new_patients:
             print(f"\nProcessing {len(new_patients)} new patients:")
@@ -3737,7 +3738,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for emergency model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_emergency, processed_feature_names, 
-                n_features=30,  # Select top 30 features
+                n_features_range=(5, 50, 5),  # Select top 30 features
                 method='ensemble'  # Use ensemble of methods for better selection
             )
             
@@ -4222,7 +4223,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for emergency model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_emergency, features['feature_names'], 
-                n_features=30,  # Select top 30 features
+                n_features_range=(5, 50, 5),  # Select top 30 features
                 method='ensemble'  # Use ensemble of methods for better selection
             )
             
@@ -4302,7 +4303,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for diagnosis model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_diagnosis, features['feature_names'], 
-                n_features=40,  # Select more features for multi-label
+                n_features_range=(5, 50, 5),  # Select more features for multi-label
                 method='ensemble'
             )
             
@@ -4378,7 +4379,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for medication model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_medication, features['feature_names'], 
-                n_features=40,
+                n_features_range=(5, 50, 5),
                 method='ensemble'
             )
             
@@ -4454,7 +4455,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for procedure model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_procedure, features['feature_names'], 
-                n_features=40,
+                n_features_range=(5, 50, 5),
                 method='ensemble'
             )
             
@@ -4895,7 +4896,7 @@ class ClinicalPredictionModel:
     def tune_model_hyperparameters(self, X_train, y_train, X_val, y_val, model_type='binary', 
                                 tuning_epochs=30, search_epochs=5, max_trials=20):
         """
-        Use Keras Tuner to optimize hyperparameters for the prediction model
+        Use Keras Tuner to optimize hyperparameters for the prediction model with F1 score as the primary metric
         
         Args:
             X_train: Training feature matrix
@@ -4910,6 +4911,19 @@ class ClinicalPredictionModel:
         Returns:
             Optimized model and hyperparameter search results
         """
+        import os
+        import numpy as np
+        from tensorflow import keras
+        import tensorflow as tf
+        import keras_tuner as kt
+        from datetime import datetime
+        
+        # Create directory for checkpoints
+        os.makedirs('optimized_saved_models/checkpoints', exist_ok=True)
+        
+        # Get timestamp for unique checkpoint naming
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
         input_shape = X_train.shape[1]  # Number of features
         
         # For multi-label models, get the number of output classes
@@ -5003,10 +5017,15 @@ class ClinicalPredictionModel:
                 keras.metrics.BinaryAccuracy(name='accuracy'),
                 keras.metrics.AUC(name='auc'),
                 keras.metrics.Precision(name='precision'),
-                keras.metrics.Recall(name='recall')
+                keras.metrics.Recall(name='recall'),
+                keras.metrics.F1Score(
+                    name='f1_score',
+                    threshold=0.5,
+                    dtype=tf.float32
+                )
             ]
             
-            # Compile model
+            # Compile model - use binary_crossentropy for both binary and multi-label
             model.compile(
                 optimizer=optimizer,
                 loss='binary_crossentropy',
@@ -5015,22 +5034,30 @@ class ClinicalPredictionModel:
             
             return model
         
-        # Create instance of the tuner
+        # Create instance of the tuner - now using F1 Score as the objective
         tuner = kt.Hyperband(
             build_model,
-            objective=kt.Objective('val_auc', direction='max'),
+            objective=kt.Objective('val_f1_score', direction='max'),  # Changed from 'val_auc' to 'val_f1_score'
             max_epochs=tuning_epochs,
             factor=3,
             directory='hyperparameter_tuning',
-            project_name=f'clinical_prediction_{model_type}',
+            project_name=f'clinical_prediction_{model_type}_{timestamp}',
             overwrite=True
         )
         
         # Define early stopping callback for the search
         early_stopping = keras.callbacks.EarlyStopping(
-            monitor='val_loss',
+            monitor='val_f1_score',  # Changed from 'val_loss' to 'val_f1_score'
             patience=5,
             restore_best_weights=True
+        )
+        
+        # Add checkpoint callback like in train_models
+        checkpoint_callback = keras.callbacks.ModelCheckpoint(
+            filepath=f'saved_models/checkpoints/{model_type}_tuning_{timestamp}_epoch_{{epoch:02d}}.keras',
+            save_best_only=False,  # Save every epoch
+            save_weights_only=False,
+            verbose=1
         )
         
         # Print search space summary
@@ -5054,7 +5081,7 @@ class ClinicalPredictionModel:
                         X_train, y_train,
                         validation_data=(X_val, y_val),
                         epochs=tuning_epochs,
-                        callbacks=[early_stopping],
+                        callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
                         class_weight=class_weight,
                         verbose=1
                     )
@@ -5065,7 +5092,7 @@ class ClinicalPredictionModel:
                         X_train, y_train, 
                         validation_data=(X_val, y_val),
                         epochs=tuning_epochs,
-                        callbacks=[early_stopping],
+                        callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
                         verbose=1
                     )
             else:
@@ -5074,7 +5101,7 @@ class ClinicalPredictionModel:
                     X_train, y_train, 
                     validation_data=(X_val, y_val),
                     epochs=tuning_epochs,
-                    callbacks=[early_stopping],
+                    callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
                     verbose=1
                 )
         else:
@@ -5089,7 +5116,7 @@ class ClinicalPredictionModel:
                 X_train, y_train,
                 validation_data=(X_val, y_val),
                 epochs=tuning_epochs,
-                callbacks=[early_stopping],
+                callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
                 sample_weight=sample_weights,
                 verbose=1
             )
@@ -5102,6 +5129,23 @@ class ClinicalPredictionModel:
         
         # Build model with best hyperparameters
         best_model = build_model(best_hp)
+        
+        # Add reduce learning rate callback for final training
+        reduce_lr = keras.callbacks.ReduceLROnPlateau(
+            monitor='val_f1_score',  # Monitor F1 score
+            factor=0.5,
+            patience=3,
+            min_lr=0.00001,
+            verbose=1
+        )
+        
+        # Create checkpoint callback for best model
+        final_checkpoint_callback = keras.callbacks.ModelCheckpoint(
+            filepath=f'saved_models/checkpoints/{model_type}_best_{timestamp}_epoch_{{epoch:02d}}.keras',
+            save_best_only=False,
+            save_weights_only=False,
+            verbose=1
+        )
         
         # Train final model with best hyperparameters
         if model_type == 'binary' and len(np.unique(y_train)) <= 2:
@@ -5116,7 +5160,11 @@ class ClinicalPredictionModel:
                     X_train, y_train,
                     validation_data=(X_val, y_val),
                     epochs=search_epochs,
-                    callbacks=[early_stopping],
+                    callbacks=[
+                        early_stopping, 
+                        reduce_lr,
+                        final_checkpoint_callback
+                    ],
                     class_weight=class_weight,
                     verbose=1
                 )
@@ -5125,7 +5173,11 @@ class ClinicalPredictionModel:
                     X_train, y_train,
                     validation_data=(X_val, y_val),
                     epochs=search_epochs,
-                    callbacks=[early_stopping],
+                    callbacks=[
+                        early_stopping, 
+                        reduce_lr,
+                        final_checkpoint_callback
+                    ],
                     verbose=1
                 )
         else:
@@ -5138,7 +5190,11 @@ class ClinicalPredictionModel:
                 X_train, y_train,
                 validation_data=(X_val, y_val),
                 epochs=search_epochs,
-                callbacks=[early_stopping],
+                callbacks=[
+                    early_stopping, 
+                    reduce_lr,
+                    final_checkpoint_callback
+                ],
                 sample_weight=sample_weights,
                 verbose=1
             )
@@ -5152,9 +5208,11 @@ class ClinicalPredictionModel:
             print(f"{metric}: {value:.4f}")
         
         # Plot training history
-        plt.figure(figsize=(12, 5))
+        import matplotlib.pyplot as plt
         
-        plt.subplot(1, 2, 1)
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(1, 3, 1)
         plt.plot(history.history['loss'], label='Train Loss')
         plt.plot(history.history['val_loss'], label='Validation Loss')
         plt.title('Loss')
@@ -5162,16 +5220,24 @@ class ClinicalPredictionModel:
         plt.ylabel('Loss')
         plt.legend()
         
-        plt.subplot(1, 2, 2)
-        plt.plot(history.history['auc'], label='Train AUC')
-        plt.plot(history.history['val_auc'], label='Validation AUC')
-        plt.title('AUC')
+        plt.subplot(1, 3, 2)
+        plt.plot(history.history['f1_score'], label='Train F1')
+        plt.plot(history.history['val_f1_score'], label='Validation F1')
+        plt.title('F1 Score')
         plt.xlabel('Epoch')
-        plt.ylabel('AUC')
+        plt.ylabel('F1 Score')
+        plt.legend()
+        
+        plt.subplot(1, 3, 3)
+        plt.plot(history.history['precision'], label='Precision')
+        plt.plot(history.history['recall'], label='Recall')
+        plt.title('Precision and Recall')
+        plt.xlabel('Epoch')
+        plt.ylabel('Value')
         plt.legend()
         
         plt.tight_layout()
-        plt.savefig(f'hyperparameter_tuning/final_model_{model_type}_training.png')
+        plt.savefig(f'hyperparameter_tuning/final_model_{model_type}_training_{timestamp}.png')
         plt.close()
         
         return {
@@ -5179,26 +5245,28 @@ class ClinicalPredictionModel:
             'best_hyperparameters': best_hp.values,
             'metrics': metrics,
             'history': history.history,
-            'tuner': tuner
+            'tuner': tuner,
+            'timestamp': timestamp
         }
 
 
-    def enhanced_feature_selection(self, X, y, feature_names, n_features=50, method='ensemble', 
-                                n_folds=5, plot_results=True):
+    def enhanced_feature_selection(self, X, y, feature_names, n_features_range=(5, 50, 5), method='ensemble', 
+                            n_folds=5, plot_results=True, eval_method='cv'):
         """
-        Perform enhanced feature selection using multiple advanced methods
+        Perform enhanced feature selection using multiple advanced methods and find optimal feature count
         
         Args:
             X: Input features
             y: Target values
             feature_names: List of feature names
-            n_features: Target number of features to select
+            n_features_range: Tuple of (min_features, max_features, step) or list of feature counts to evaluate
             method: Selection method ('ensemble', 'rfe', 'boruta', 'shap', 'mutual_info')
-            n_folds: Number of cross-validation folds for ensemble method
+            n_folds: Number of cross-validation folds for evaluation
             plot_results: Whether to create visualization of selected features
+            eval_method: Evaluation method ('cv' for cross-validation or 'validation' to use a validation set)
             
         Returns:
-            Dictionary with selected feature indices, names, and importance scores
+            Dictionary with selected feature indices, names, importance scores and optimal feature count
         """
         import os
         import numpy as np
@@ -5207,8 +5275,10 @@ class ClinicalPredictionModel:
         import seaborn as sns
         from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
         from sklearn.feature_selection import mutual_info_classif, f_classif
+        from sklearn.model_selection import cross_val_score, StratifiedKFold
+        from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 
-        print(f"Performing enhanced feature selection using {method} method...")
+        print(f"Performing enhanced feature selection using {method} method with feature count optimization...")
         
         # Verify dimensions of inputs
         print(f"X shape: {X.shape}, feature_names length: {len(feature_names)}")
@@ -5233,17 +5303,38 @@ class ClinicalPredictionModel:
             # If already 1D, ensure it's flattened
             target = y.flatten() if len(y.shape) > 1 else y
         
+        # Parse n_features_range parameter
+        if isinstance(n_features_range, tuple) and len(n_features_range) == 3:
+            min_features, max_features, step = n_features_range
+            feature_counts = list(range(min_features, min(max_features+1, X.shape[1]), step))
+        elif isinstance(n_features_range, list):
+            feature_counts = [count for count in n_features_range if count <= X.shape[1]]
+        else:
+            # Default to a range of feature counts
+            feature_counts = [10, 20, 30, 50, 75, 100]
+            feature_counts = [count for count in feature_counts if count <= X.shape[1]]
+        
+        # Ensure we have at least one feature count
+        if not feature_counts:
+            feature_counts = [min(30, X.shape[1])]
+        
+        print(f"Evaluating feature counts: {feature_counts}")
+        
         # Initialize results dictionary
         results = {
             'selected_indices': [],
             'selected_features': [],
             'importance_scores': {},
-            'method': method
+            'method': method,
+            'evaluated_feature_counts': feature_counts,
+            'feature_count_scores': {},
+            'optimal_feature_count': None
         }
         
         # Create a DataFrame for feature importance visualization
         features_df = pd.DataFrame({'Feature': feature_names})
         
+        # Step 1: Calculate importance scores for all features
         if method == 'ensemble':
             # Ensemble method: combine multiple feature selection techniques
             print("Using ensemble feature selection approach...")
@@ -5299,7 +5390,6 @@ class ClinicalPredictionModel:
                 features_df['F_Score'] = np.zeros(X.shape[1])
             
             # 5. Lasso feature selection with cross-validation
-            # (Handles multicollinearity better than univariate methods)
             lasso_importance = np.zeros(X.shape[1])
             
             if X.shape[0] > 10:  # Only run if we have enough samples
@@ -5329,7 +5419,6 @@ class ClinicalPredictionModel:
             features_df['Lasso_Importance'] = lasso_importance
             
             # Calculate aggregated importance scores
-            # Normalize each method's scores to 0-1 scale and then combine
             ensemble_importance = np.zeros(X.shape[1])
             
             for method_name, importance in importance_methods.items():
@@ -5353,15 +5442,8 @@ class ClinicalPredictionModel:
                 'Importance': ensemble_importance
             }).sort_values('Importance', ascending=False)
             
-            # Select top n_features
-            selected_features = feature_ranking.head(n_features)
-            selected_indices = [list(feature_names).index(feat) for feat in selected_features['Feature']]
-            
-            # Store in results
-            results['selected_indices'] = selected_indices
-            results['selected_features'] = selected_features['Feature'].tolist()
-            results['importance_scores'] = dict(zip(selected_features['Feature'], selected_features['Importance']))
-            results['all_features_df'] = features_df
+            # Store all feature rankings regardless of the count
+            all_feature_importances = dict(zip(feature_ranking['Feature'], feature_ranking['Importance']))
             
         else:
             # Default to Random Forest importance
@@ -5374,53 +5456,136 @@ class ClinicalPredictionModel:
             importances = rf.feature_importances_
             
             # Create a dataframe of features and importances
-            feature_importance = pd.DataFrame({
+            feature_ranking = pd.DataFrame({
                 'Feature': feature_names,
                 'Importance': importances
-            })
-            
-            # Sort by importance
-            feature_importance = feature_importance.sort_values('Importance', ascending=False)
-            
-            # Select top n features
-            selected_features = feature_importance.head(n_features)
-            
-            # Get indices of selected features
-            selected_indices = [list(feature_names).index(feat) for feat in selected_features['Feature']]
+            }).sort_values('Importance', ascending=False)
             
             features_df['RF_Importance'] = importances
             
-            # Store results
-            results['selected_indices'] = selected_indices
-            results['selected_features'] = selected_features['Feature'].tolist()
-            results['importance_scores'] = dict(zip(selected_features['Feature'], 
-                                                selected_features['Importance']))
-            results['all_features_df'] = features_df
+            # Store all feature importances
+            all_feature_importances = dict(zip(feature_ranking['Feature'], feature_ranking['Importance']))
         
-        # Verify results integrity
-        if not results['selected_indices'] or len(results['selected_indices']) == 0:
-            print("WARNING: No features were selected. Using top features by default.")
-            # Default to top features by index
-            results['selected_indices'] = list(range(min(n_features, X.shape[1])))
-            results['selected_features'] = [feature_names[i] for i in results['selected_indices']]
-            default_importance = np.ones(len(results['selected_indices']))
-            results['importance_scores'] = dict(zip(results['selected_features'], default_importance))
+        # Step 2: Evaluate different feature counts to find the optimal number
+        print("\nEvaluating performance with different feature counts...")
         
-        # Plot feature importances
+        # Split data for validation if needed
+        if eval_method == 'validation':
+            from sklearn.model_selection import train_test_split
+            X_train, X_val, y_train, y_val = train_test_split(X, target, test_size=0.2, random_state=42)
+        
+        evaluation_scores = {}
+        
+        # Create a classifier for evaluation
+        eval_clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        
+        for n_feat in feature_counts:
+            print(f"Evaluating with {n_feat} features...")
+            
+            # Get top n_feat features
+            top_features = feature_ranking.head(n_feat)
+            selected_indices = [list(feature_names).index(feat) for feat in top_features['Feature']]
+            
+            # Use only selected features
+            X_selected = X[:, selected_indices]
+            
+            # Evaluate using cross-validation or validation set
+            if eval_method == 'cv':
+                # Use stratified k-fold cross-validation
+                cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+                cv_scores = {
+                    'accuracy': cross_val_score(eval_clf, X_selected, target, cv=cv, scoring='accuracy'),
+                    'auc': cross_val_score(eval_clf, X_selected, target, cv=cv, scoring='roc_auc'),
+                    'f1': cross_val_score(eval_clf, X_selected, target, cv=cv, scoring='f1')
+                }
+                
+                # Average scores
+                avg_scores = {metric: scores.mean() for metric, scores in cv_scores.items()}
+                std_scores = {metric: scores.std() for metric, scores in cv_scores.items()}
+                
+                evaluation_scores[n_feat] = {
+                    'avg_scores': avg_scores,
+                    'std_scores': std_scores,
+                    'selected_indices': selected_indices,
+                    'selected_features': top_features['Feature'].tolist()
+                }
+                
+                print(f"  CV Results - Accuracy: {avg_scores['accuracy']:.4f}, AUC: {avg_scores['auc']:.4f}, F1: {avg_scores['f1']:.4f}")
+                
+            else:  # validation set
+                # Train on training set
+                X_train_selected = X_train[:, selected_indices]
+                X_val_selected = X_val[:, selected_indices]
+                
+                eval_clf.fit(X_train_selected, y_train)
+                
+                # Predict on validation set
+                y_pred = eval_clf.predict(X_val_selected)
+                y_pred_proba = eval_clf.predict_proba(X_val_selected)[:, 1] if hasattr(eval_clf, 'predict_proba') else None
+                
+                # Calculate metrics
+                val_scores = {
+                    'accuracy': accuracy_score(y_val, y_pred),
+                    'f1': f1_score(y_val, y_pred),
+                    'precision': precision_score(y_val, y_pred),
+                    'recall': recall_score(y_val, y_pred)
+                }
+                
+                if y_pred_proba is not None:
+                    val_scores['auc'] = roc_auc_score(y_val, y_pred_proba)
+                
+                evaluation_scores[n_feat] = {
+                    'val_scores': val_scores,
+                    'selected_indices': selected_indices,
+                    'selected_features': top_features['Feature'].tolist()
+                }
+                
+                print(f"  Val Results - Accuracy: {val_scores['accuracy']:.4f}, " + 
+                    (f"AUC: {val_scores['auc']:.4f}, " if 'auc' in val_scores else "") + 
+                    f"F1: {val_scores['f1']:.4f}")
+        
+        # Step 3: Find the optimal feature count based on F1 score
+        if eval_method == 'cv':
+            f1_scores = {n_feat: scores['avg_scores']['f1'] for n_feat, scores in evaluation_scores.items()}
+        else:
+            f1_scores = {n_feat: scores['val_scores']['f1'] for n_feat, scores in evaluation_scores.items()}
+        
+        # Find the optimal feature count (highest F1 score)
+        optimal_n_features = max(f1_scores.items(), key=lambda x: x[1])[0]
+        
+        print(f"\nOptimal feature count: {optimal_n_features} with F1 score: {f1_scores[optimal_n_features]:.4f}")
+        
+        # Get the results for the optimal feature count
+        optimal_results = evaluation_scores[optimal_n_features]
+        selected_indices = optimal_results['selected_indices']
+        selected_features = optimal_results['selected_features']
+        
+        # Create importance scores for selected features
+        importance_scores = {feature: all_feature_importances.get(feature, 0.0) for feature in selected_features}
+        
+        # Store final results
+        results['selected_indices'] = selected_indices
+        results['selected_features'] = selected_features
+        results['importance_scores'] = importance_scores
+        results['feature_count_scores'] = f1_scores
+        results['optimal_feature_count'] = optimal_n_features
+        results['evaluation_scores'] = evaluation_scores
+        results['all_features_df'] = features_df
+        
+        # Plot feature importance and count evaluation results
         if plot_results:
             # Create directory for plots
             os.makedirs('feature_selection', exist_ok=True)
             
-            # Get top 30 features or all if less than 30
-            n_to_plot = min(30, len(results['selected_features']))
+            # 1. Plot optimal feature set importance scores
+            n_to_plot = min(30, len(selected_features))
             
-            # Sort features by importance
+            # Sort features by importance for plotting
             plot_df = pd.DataFrame({
-                'Feature': results['selected_features'],
-                'Importance': list(results['importance_scores'].values())
+                'Feature': selected_features,
+                'Importance': [importance_scores[feature] for feature in selected_features]
             }).sort_values('Importance', ascending=False).head(n_to_plot)
             
-            # Create horizontal bar plot
             plt.figure(figsize=(12, max(6, n_to_plot * 0.3)))
             ax = sns.barplot(x='Importance', y='Feature', data=plot_df)
             
@@ -5428,18 +5593,75 @@ class ClinicalPredictionModel:
             for i, v in enumerate(plot_df['Importance']):
                 ax.text(v + 0.001, i, f"{v:.4f}", va='center')
             
-            plt.title(f'Top {n_to_plot} Features Selected by {method.replace("_", " ").title()} Method')
+            plt.title(f'Top {n_to_plot} Features from Optimal Set of {optimal_n_features} Features')
             plt.xlabel('Importance Score')
             plt.tight_layout()
-            plt.savefig(f'feature_selection/{method}_importance.png')
+            plt.savefig(f'feature_selection/optimal_feature_set_{method}.png')
+            plt.close()
+            
+            # 2. Plot feature count evaluation results
+            plt.figure(figsize=(10, 6))
+            
+            # Plot F1 scores vs. feature count
+            plt.plot(list(f1_scores.keys()), list(f1_scores.values()), 'o-', label='F1 Score')
+            
+            # Mark the optimal feature count
+            plt.axvline(x=optimal_n_features, color='r', linestyle='--', 
+                        label=f'Optimal: {optimal_n_features} features')
+            
+            # Add a point at the optimal feature count
+            optimal_f1 = f1_scores[optimal_n_features]
+            plt.plot(optimal_n_features, optimal_f1, 'ro', markersize=10)
+            plt.annotate(f'F1={optimal_f1:.4f}', 
+                        (optimal_n_features, optimal_f1),
+                        xytext=(10, -20),
+                        textcoords='offset points')
+            
+            plt.title(f'Feature Count Evaluation ({method} method)')
+            plt.xlabel('Number of Features')
+            plt.ylabel('F1 Score')
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f'feature_selection/feature_count_evaluation_{method}.png')
+            plt.close()
+            
+            # 3. Plot all evaluation metrics for different feature counts
+            plt.figure(figsize=(12, 6))
+            
+            if eval_method == 'cv':
+                metrics = ['accuracy', 'auc', 'f1']
+                for metric in metrics:
+                    values = [scores['avg_scores'][metric] for n_feat, scores in evaluation_scores.items()]
+                    plt.plot(feature_counts, values, 'o-', label=metric.upper())
+            else:
+                metrics = ['accuracy', 'precision', 'recall', 'f1']
+                if 'auc' in evaluation_scores[feature_counts[0]]['val_scores']:
+                    metrics.append('auc')
+                    
+                for metric in metrics:
+                    values = [scores['val_scores'][metric] for n_feat, scores in evaluation_scores.items()]
+                    plt.plot(feature_counts, values, 'o-', label=metric.upper())
+            
+            # Mark the optimal feature count
+            plt.axvline(x=optimal_n_features, color='r', linestyle='--', 
+                        label=f'Optimal: {optimal_n_features} features')
+            
+            plt.title(f'Performance Metrics vs. Feature Count ({method} method)')
+            plt.xlabel('Number of Features')
+            plt.ylabel('Score')
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f'feature_selection/metrics_comparison_{method}.png')
             plt.close()
         
-        print(f"Selected {len(results['selected_indices'])} features with {method} method")
+        print(f"Selected {len(selected_indices)} features with {method} method (optimal count: {optimal_n_features})")
         print(f"Top 10 selected features:")
         
         # Print top features and their importance scores
-        for i, feature in enumerate(results['selected_features'][:10]):
-            importance = results['importance_scores'][feature]
+        for i, feature in enumerate(selected_features[:10]):
+            importance = importance_scores[feature]
             print(f"{i+1}. {feature} (Importance: {importance:.6f})")
         
         return results
@@ -5493,7 +5715,7 @@ class ClinicalPredictionModel:
             # Perform feature selection
             selection_result = self.enhanced_feature_selection(
                 X_boot, y_boot, feature_names, 
-                n_features=n_features, method=method,
+                n_features_range=(5, 50, 5), method=method,
                 plot_results=False
             )
             
@@ -5584,3 +5806,290 @@ class ClinicalPredictionModel:
             print(f"{i+1}. {feature}: {prob*100:.1f}% (avg rank: {avg_rank:.1f})")
         
         return stability_results
+    
+
+
+
+    def balance_unified_timeline(self,filepath, random_seed=42, save_dir=None, preserve_positives=True):
+        """
+        Load timeline data and create a single balanced dataset that achieves good balance
+        for all target variables (emergency_visit, diagnosis, medication, procedure).
+        
+        Args:
+            filepath: Path to the timeline CSV file
+            random_seed: Random seed for reproducibility (must be an integer)
+            save_dir: Directory to save balanced dataset (defaults to same directory as input file)
+            preserve_positives: Whether to preserve all positive examples for all targets (default True)
+            
+        Returns:
+            Balanced DataFrame that achieves good balance for all target variables
+        """
+        print(f"Loading timeline data from {filepath}")
+        
+        try:
+            # Ensure random_seed is an integer
+            try:
+                random_seed = int(random_seed)
+            except (ValueError, TypeError):
+                print(f"Warning: random_seed '{random_seed}' is not a valid integer. Using default value 42.")
+                random_seed = 42
+                
+            # Set random seed for reproducibility
+            np.random.seed(random_seed)
+            
+            # Set save directory
+            if save_dir is None:
+                save_dir = os.path.dirname(filepath)
+                if not save_dir:  # If filepath doesn't have a directory part
+                    save_dir = "."
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # Check if file exists
+            if not os.path.exists(filepath):
+                print(f"Error: File '{filepath}' not found.")
+                return None
+            
+            # Load the CSV file
+            try:
+                df = pd.read_csv(filepath, low_memory=False)
+            except Exception as e:
+                print(f"Error loading CSV file: {str(e)}")
+                return None
+                
+            # Store original columns to preserve at the end
+            original_columns = df.columns.tolist()
+            
+            filename = os.path.basename(filepath).split('.')[0]
+            original_row_count = len(df)
+            print(f"Original data rows: {original_row_count}")
+            
+            # Create timestamp for output files
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Count NaN values per row
+            df['nan_count'] = df.isna().sum(axis=1)
+            
+            # Check how many rows have NaN values
+            nan_row_count = (df['nan_count'] > 0).sum()
+            print(f"Rows with at least one NaN value: {nan_row_count} ({nan_row_count/len(df)*100:.1f}%)")
+            
+            # Define target columns and corresponding model names
+            target_columns = {
+                'HAD_EMERGENCY_NEXT_MONTH': 'emergency_visit',
+                'NEW_DIAGNOSES_NEXT_MONTH': 'diagnosis',
+                'NEW_MEDICATIONS_NEXT_MONTH': 'medication', 
+                'NEW_PROCEDURES_NEXT_MONTH': 'procedure'
+            }
+            
+            # Verify target columns exist in dataset
+            missing_columns = [col for col in target_columns.keys() if col not in df.columns]
+            if missing_columns:
+                print(f"Warning: The following target columns are missing from the dataset: {missing_columns}")
+                # Remove missing columns from the dictionary
+                for col in missing_columns:
+                    del target_columns[col]
+                    
+            if not target_columns:
+                print("Error: No valid target columns found in the dataset.")
+                return None
+            
+            # First, drop rows where any target column is NaN (essential for model training)
+            df_filtered = df.dropna(subset=list(target_columns.keys()))
+            print(f"Rows after dropping target NaNs: {len(df_filtered)}")
+            
+            # Track new columns to remove later
+            columns_to_remove = ['nan_count']
+            
+            # Prepare target columns for classification
+            for target_column, model_name in target_columns.items():
+                if model_name == 'emergency_visit':
+                    # Convert emergency target to boolean
+                    if df_filtered[target_column].dtype == 'object':
+                        def to_bool(value):
+                            if isinstance(value, bool):
+                                return value
+                            if isinstance(value, (int, float)):
+                                return bool(value)
+                            if isinstance(value, str):
+                                return value.lower() in ('true', 't', 'yes', 'y', '1')
+                            return False
+                        
+                        df_filtered[target_column] = df_filtered[target_column].apply(to_bool)
+                else:
+                    # For multi-label targets, create binary indicators
+                    def parse_list(value):
+                        try:
+                            if isinstance(value, str):
+                                if value.startswith('[') and value.endswith(']'):
+                                    parsed = eval(value)
+                                    if isinstance(parsed, list):
+                                        return parsed
+                            if isinstance(value, list):
+                                return value
+                            return []
+                        except Exception:
+                            return []
+                    
+                    list_col = f'{target_column}_list'
+                    binary_col = f'{target_column}_any'
+                    
+                    df_filtered[list_col] = df_filtered[target_column].apply(parse_list)
+                    df_filtered[binary_col] = df_filtered[list_col].apply(lambda x: len(x) > 0)
+                    
+                    # Track these columns to remove later
+                    columns_to_remove.extend([list_col, binary_col])
+            
+            # Print initial distributions
+            print("\n==== Initial class distributions ====")
+            positives_by_target = {}
+            for target_column, model_name in target_columns.items():
+                binary_col = target_column if model_name == 'emergency_visit' else f'{target_column}_any'
+                positive_count = df_filtered[binary_col].sum()
+                negative_count = len(df_filtered) - positive_count
+                positives_by_target[binary_col] = positive_count
+                print(f"{model_name}: {positive_count} positive, {negative_count} negative "
+                    f"({positive_count/len(df_filtered)*100:.1f}% positive)")
+            
+            # Create a new strategy: preserve all positive examples for all targets
+            if preserve_positives:
+                print("\n==== Strategy: Preserve all positive examples for all targets ====")
+                
+                # Create masks for positive examples for each target
+                positive_masks = {}
+                for target_column, model_name in target_columns.items():
+                    binary_col = target_column if model_name == 'emergency_visit' else f'{target_column}_any'
+                    positive_masks[binary_col] = df_filtered[binary_col] == True
+                
+                # Combine masks to find rows that are positive for any target
+                combined_positive_mask = pd.Series(False, index=df_filtered.index)
+                for mask in positive_masks.values():
+                    combined_positive_mask = combined_positive_mask | mask
+                
+                # Rows that are positive for at least one target
+                positive_rows = df_filtered[combined_positive_mask].copy()
+                
+                # Rows that are negative for all targets
+                negative_rows = df_filtered[~combined_positive_mask].copy()
+                
+                print(f"Rows positive for at least one target: {len(positive_rows)}")
+                print(f"Rows negative for all targets: {len(negative_rows)}")
+                
+                # Determine how many negatives to keep
+                if len(negative_rows) <= len(positive_rows):
+                    # If we have fewer negative rows than positive rows, keep all negatives
+                    negative_sample = negative_rows
+                else:
+                    # Sort negative rows by nan_count (ascending = fewer NaNs first)
+                    negative_rows = negative_rows.sort_values('nan_count')
+                    
+                    # Sample enough negative rows to achieve balance
+                    negative_sample = negative_rows.head(len(positive_rows))
+                    
+                # Combine positive and negative rows
+                df_balanced = pd.concat([positive_rows, negative_sample])
+                
+                print(f"Final balanced dataset: {len(df_balanced)} rows")
+            else:
+                # Fall back to original strategy if preserve_positives is False
+                print("\n==== Strategy: Optimize for overall balance ====")
+                
+                # Create a unified balance score for each row
+                df_filtered['balance_score'] = 0
+                columns_to_remove.append('balance_score')
+                
+                # Calculate balance score for each target
+                balance_weights = {}
+                
+                for target_column, model_name in target_columns.items():
+                    # Determine the target column to use for balancing
+                    balance_col = target_column if model_name == 'emergency_visit' else f'{target_column}_any'
+                    
+                    # Count positive and negative examples
+                    positive_count = df_filtered[balance_col].sum() 
+                    negative_count = len(df_filtered) - positive_count
+                    
+                    # Calculate ratio of positive to negative
+                    if negative_count > 0:
+                        pos_neg_ratio = positive_count / negative_count
+                    else:
+                        pos_neg_ratio = float('inf')
+                        
+                    # Store the weight for this target
+                    balance_weights[balance_col] = pos_neg_ratio
+                    
+                    # Add to balance score
+                    if pos_neg_ratio < 1:
+                        # Need more positive examples, so increase value of positive examples
+                        df_filtered.loc[df_filtered[balance_col] == True, 'balance_score'] += (1/pos_neg_ratio)
+                    else:
+                        # Need more negative examples, so increase value of negative examples
+                        df_filtered.loc[df_filtered[balance_col] == False, 'balance_score'] += pos_neg_ratio
+                
+                print("\n==== Balance weights calculated ====")
+                for col, weight in balance_weights.items():
+                    print(f"{col}: {weight:.2f}")
+                
+                # Now sort by balance_score (higher value = more important for balancing)
+                # When two rows have same balance score, prefer the one with fewer NaNs
+                df_filtered['sort_key'] = df_filtered['balance_score'] - df_filtered['nan_count'] / df_filtered['nan_count'].max()
+                columns_to_remove.append('sort_key')
+                
+                # Sort by our composite score
+                df_sorted = df_filtered.sort_values('sort_key', ascending=False)
+                
+                # Determine optimal size
+                min_rows_needed = 0
+                for target_column, model_name in target_columns.items():
+                    balance_col = target_column if model_name == 'emergency_visit' else f'{target_column}_any'
+                    positive_count = df_filtered[balance_col].sum()
+                    negative_count = len(df_filtered) - positive_count
+                    min_rows_needed = max(min_rows_needed, 2 * min(positive_count, negative_count))
+                
+                # Keep the top N rows with the highest balance scores
+                target_size = min(min_rows_needed, len(df_filtered))
+                df_balanced = df_sorted.head(target_size)
+            
+            # Print final distribution
+            print("\n==== Final class distributions ====")
+            for target_column, model_name in target_columns.items():
+                binary_col = target_column if model_name == 'emergency_visit' else f'{target_column}_any'
+                positive_count = df_balanced[binary_col].sum()
+                negative_count = len(df_balanced) - positive_count
+                initial_positive = positives_by_target[binary_col]
+                
+                print(f"{model_name}: {positive_count} positive, {negative_count} negative "
+                    f"({positive_count/len(df_balanced)*100:.1f}% positive)")
+                
+                if preserve_positives:
+                    # Check if we preserved all positives
+                    positive_retention = (positive_count / initial_positive) * 100
+                    print(f"  - Retained {positive_count}/{initial_positive} positive examples ({positive_retention:.1f}%)")
+            
+            # Remove auxiliary columns used for balancing
+            print(f"\nRemoving {len(columns_to_remove)} auxiliary columns added during processing")
+            df_balanced = df_balanced.drop(columns=columns_to_remove)
+            
+            # Check if any columns were added that weren't in the original
+            extra_columns = [col for col in df_balanced.columns if col not in original_columns]
+            if extra_columns:
+                print(f"Warning: The following columns were added during processing and will be removed: {extra_columns}")
+                df_balanced = df_balanced.drop(columns=extra_columns)
+            
+            # Verify that final columns match original columns
+            missing_columns = [col for col in original_columns if col not in df_balanced.columns]
+            if missing_columns:
+                print(f"Warning: The following original columns are missing from the final dataset: {missing_columns}")
+            
+            # Save the balanced dataset
+            balanced_filepath = os.path.join(
+                save_dir, f'{filename}_unified_balanced_{timestamp}.csv')
+            df_balanced.to_csv(balanced_filepath, index=False)
+            print(f"\nSaved unified balanced dataset to {balanced_filepath}")
+            
+            return df_balanced
+            
+        except Exception as e:
+            print(f"Error processing timeline data: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
