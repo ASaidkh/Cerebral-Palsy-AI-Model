@@ -1180,11 +1180,11 @@ class ClinicalPredictionModel:
     
     def prepare_features(self, timeline_df, exclude_cols=None):
         """
-        Prepare features for model training, handling missing values and scaling
+        Prepare features for model training with improved feature name tracking
         
         Args:
             timeline_df: DataFrame with patient timeline features
-            exclude_cols: List of columns to exclude from feature set (defaults to time and target cols)
+            exclude_cols: List of columns to exclude from feature set
             
         Returns:
             Dictionary with processed features and metadata
@@ -1211,7 +1211,7 @@ class ClinicalPredictionModel:
         X = timeline_df.drop(cols_to_exclude, axis=1, errors='ignore')
         print(f"Feature columns after exclusion: {len(X.columns)}")
         
-        # Convert problematic numeric columns to numeric type with NaN for non-convertible values
+        # Convert problematic numeric columns to numeric type
         numeric_prefixes = ['VITAL_', 'COND_', 'MED_', 'PROC_', 'IMG_', 'DEV_', 'ALLERGY_', 
                             'IMMUNIZATION_', 'IMM_', 'UTIL_']
         
@@ -1228,69 +1228,115 @@ class ClinicalPredictionModel:
         
         print(f"Identified {len(categorical_features)} categorical and {len(numerical_features)} numerical features")
         
-        # Create preprocessor
+        # Check unique values in categorical features to estimate one-hot encoded dimensions
+        expected_encoded_features = 0
+        for cat_col in categorical_features:
+            n_unique = X[cat_col].nunique(dropna=False)  # Count including NaN
+            print(f"Categorical column '{cat_col}' has {n_unique} unique values")
+            expected_encoded_features += n_unique
+        
+        # The expected total features after one-hot encoding
+        expected_total_features = len(numerical_features) + expected_encoded_features
+        print(f"Expected feature count after one-hot encoding: ~{expected_total_features}")
+        
+        # Create preprocessor with modified options
         from sklearn.compose import ColumnTransformer
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler, OneHotEncoder
         from sklearn.impute import SimpleImputer
         
+        # Handle the case where there are features with all missing values
+        imputer_strategy = 'median'
+        
+        # Set drop='first' in OneHotEncoder to avoid the dummy variable trap
+        # This will create n-1 columns for n categories
+        categorical_transformer = Pipeline([
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore', drop=None, sparse_output=False))
+        ])
+        
         preprocessor = ColumnTransformer(
             transformers=[
                 ('num', Pipeline([
-                    ('imputer', SimpleImputer(strategy='median')),
+                    ('imputer', SimpleImputer(strategy=imputer_strategy)),
                     ('scaler', StandardScaler())
                 ]), numerical_features),
-                ('cat', Pipeline([
-                    ('imputer', SimpleImputer(strategy='most_frequent')),
-                    ('onehot', OneHotEncoder(handle_unknown='ignore'))
-                ]), categorical_features)
-            ]
+                ('cat', categorical_transformer, categorical_features)
+            ],
+            verbose_feature_names_out=True
         )
         
         # Fit preprocessor
         try:
             X_processed = preprocessor.fit_transform(X)
+            
+            # Print debugging information about the transformed data
+            print(f"X_processed shape: {X_processed.shape}")
+            print(f"Actual processed feature count: {X_processed.shape[1]}")
+            
+            # Try to get detailed component information
+            if hasattr(preprocessor, 'transformers_'):
+                cat_transformer = preprocessor.transformers_[1][1]
+                if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
+                    onehot = cat_transformer.named_steps['onehot']
+                    if hasattr(onehot, 'categories_'):
+                        for i, categories in enumerate(onehot.categories_):
+                            cat_column = categorical_features[i] if i < len(categorical_features) else "unknown"
+                            print(f"Categories for '{cat_column}': {len(categories)} values - {categories}")
         except Exception as e:
             print(f"Error in preprocessing: {e}")
-            # Simplified preprocessing as fallback
-            print("Falling back to simplified preprocessing...")
+            # Simplified processing as fallback
+            print("Using simplified preprocessing as fallback")
             preprocessor = ColumnTransformer(
                 transformers=[
                     ('num', StandardScaler(), numerical_features),
-                    ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+                    ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)
                 ],
                 remainder='passthrough'
             )
             X_processed = preprocessor.fit_transform(X)
         
         # Get feature names after preprocessing
-        feature_names_processed = []
-        
         try:
-            # Try using get_feature_names_out (newer scikit-learn versions)
-            feature_names_processed = preprocessor.get_feature_names_out()
-        except:
-            try:
+            if hasattr(preprocessor, 'get_feature_names_out'):
+                feature_names_processed = preprocessor.get_feature_names_out()
+            else:
                 # For older scikit-learn versions
-                num_features = [f"{col}" for col in numerical_features]
+                feature_names_processed = []
                 
-                cat_features = []
-                if categorical_features:
-                    cat_transformer = preprocessor.transformers_[1][1]
-                    if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
-                        onehot = cat_transformer.named_steps['onehot']
-                        if hasattr(onehot, 'get_feature_names_out'):
-                            cat_features = onehot.get_feature_names_out(categorical_features)
-                        elif hasattr(onehot, 'get_feature_names'):
-                            cat_features = onehot.get_feature_names(categorical_features)
+                # Add numerical feature names
+                num_transformer = preprocessor.transformers_[0][1]
+                feature_names_processed.extend([f"num__{f}" for f in numerical_features])
                 
-                feature_names_processed = num_features + list(cat_features)
-            except Exception as e:
-                print(f"Could not extract processed feature names: {e}")
-                # Generate generic feature names
-                feature_names_processed = [f"feature_{i}" for i in range(X_processed.shape[1])]
+                # Add one-hot encoded feature names
+                cat_transformer = preprocessor.transformers_[1][1]
+                if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
+                    onehot = cat_transformer.named_steps['onehot']
+                    if hasattr(onehot, 'get_feature_names_out'):
+                        cat_names = onehot.get_feature_names_out(categorical_features)
+                        feature_names_processed.extend([f"cat__{f}" for f in cat_names])
+                    elif hasattr(onehot, 'get_feature_names'):
+                        cat_names = onehot.get_feature_names(categorical_features)
+                        feature_names_processed.extend([f"cat__{f}" for f in cat_names])
+        except Exception as e:
+            print(f"Error extracting feature names: {e}")
+            # Generate fallback feature names
+            feature_names_processed = [f"feature_{i}" for i in range(X_processed.shape[1])]
+        
+        # Verify feature name count matches the feature matrix
+        if len(feature_names_processed) != X_processed.shape[1]:
+            print(f"WARNING: Feature name count ({len(feature_names_processed)}) doesn't match feature matrix shape ({X_processed.shape[1]})")
+            print("Generating generic feature names to ensure consistency")
+            feature_names_processed = [f"feature_{i}" for i in range(X_processed.shape[1])]
         
         print(f"Original feature count: {len(X.columns)}, Processed feature count: {len(feature_names_processed)}")
+        
+        # Verify we haven't introduced any NaN values in the transformed data
+        if np.isnan(X_processed).any():
+            print("WARNING: Processed feature matrix contains NaN values!")
+            print(f"NaN count: {np.isnan(X_processed).sum()}")
+            # Replace any remaining NaNs with 0
+            X_processed = np.nan_to_num(X_processed, nan=0.0)
         
         return {
             'X': X,  # Original features DataFrame
@@ -3738,7 +3784,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for emergency model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_emergency, processed_feature_names, 
-                n_features_range=(5, 50, 5),  # Select top 30 features
+                n_features_range=(5, 80, 5),  # Select top 30 features
                 method='ensemble'  # Use ensemble of methods for better selection
             )
             
@@ -4223,7 +4269,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for emergency model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_emergency, features['feature_names'], 
-                n_features_range=(5, 50, 5),  # Select top 30 features
+                n_features_range=(5, 80, 5),  # Select top 30 features
                 method='ensemble'  # Use ensemble of methods for better selection
             )
             
@@ -4303,7 +4349,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for diagnosis model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_diagnosis, features['feature_names'], 
-                n_features_range=(5, 50, 5),  # Select more features for multi-label
+                n_features_range=(5, 80, 5),  # Select more features for multi-label
                 method='ensemble'
             )
             
@@ -4379,7 +4425,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for medication model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_medication, features['feature_names'], 
-                n_features_range=(5, 50, 5),
+                n_features_range=(5, 80, 5),
                 method='ensemble'
             )
             
@@ -4455,7 +4501,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for procedure model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_procedure, features['feature_names'], 
-                n_features_range=(5, 50, 5),
+                n_features_range=(5, 80, 5),
                 method='ensemble'
             )
             
@@ -4929,6 +4975,16 @@ class ClinicalPredictionModel:
         # For multi-label models, get the number of output classes
         num_classes = 1 if model_type == 'binary' else y_train.shape[1]
         
+        # Fix 1: Reshape y_train and y_val to be 2D for binary classification
+        # This is critical to fix the F1Score shape mismatch error
+        if model_type == 'binary' and len(y_train.shape) == 1:
+            y_train = y_train.reshape(-1, 1)
+        
+        if model_type == 'binary' and len(y_val.shape) == 1:
+            y_val = y_val.reshape(-1, 1)
+            
+        print(f"Input shapes - X_train: {X_train.shape}, y_train: {y_train.shape}, X_val: {X_val.shape}, y_val: {y_val.shape}")
+        
         # Define model-building function for Keras Tuner
         def build_model(hp):
             model = keras.Sequential()
@@ -5012,18 +5068,33 @@ class ClinicalPredictionModel:
             else:  # rmsprop
                 optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
             
-            # Define metrics based on model type
-            metrics = [
-                keras.metrics.BinaryAccuracy(name='accuracy'),
-                keras.metrics.AUC(name='auc'),
-                keras.metrics.Precision(name='precision'),
-                keras.metrics.Recall(name='recall'),
-                keras.metrics.F1Score(
-                    name='f1_score',
-                    threshold=0.5,
-                    dtype=tf.float32
-                )
-            ]
+            # Fix 2: Modified metrics configuration to ensure compatibility with reshaped data
+            if model_type == 'binary':
+                metrics = [
+                    keras.metrics.BinaryAccuracy(name='accuracy'),
+                    keras.metrics.AUC(name='auc'),
+                    keras.metrics.Precision(name='precision'),
+                    keras.metrics.Recall(name='recall'),
+                    # Ensure F1Score is configured correctly for binary classification
+                    keras.metrics.F1Score(
+                        name='f1_score',
+                        threshold=0.5,
+                        dtype=tf.float32
+                    )
+                ]
+            else:
+                # For multi-label, use default metrics configuration
+                metrics = [
+                    keras.metrics.BinaryAccuracy(name='accuracy'),
+                    keras.metrics.AUC(name='auc'),
+                    keras.metrics.Precision(name='precision'),
+                    keras.metrics.Recall(name='recall'),
+                    keras.metrics.F1Score(
+                        name='f1_score',
+                        threshold=0.5,
+                        dtype=tf.float32
+                    )
+                ]
             
             # Compile model - use binary_crossentropy for both binary and multi-label
             model.compile(
@@ -5037,7 +5108,7 @@ class ClinicalPredictionModel:
         # Create instance of the tuner - now using F1 Score as the objective
         tuner = kt.Hyperband(
             build_model,
-            objective=kt.Objective('val_f1_score', direction='max'),  # Changed from 'val_auc' to 'val_f1_score'
+            objective=kt.Objective('val_f1_score', direction='max'),
             max_epochs=tuning_epochs,
             factor=3,
             directory='hyperparameter_tuning',
@@ -5047,7 +5118,7 @@ class ClinicalPredictionModel:
         
         # Define early stopping callback for the search
         early_stopping = keras.callbacks.EarlyStopping(
-            monitor='val_f1_score',  # Changed from 'val_loss' to 'val_f1_score'
+            monitor='val_f1_score',
             patience=5,
             restore_best_weights=True
         )
@@ -5055,7 +5126,7 @@ class ClinicalPredictionModel:
         # Add checkpoint callback like in train_models
         checkpoint_callback = keras.callbacks.ModelCheckpoint(
             filepath=f'saved_models/checkpoints/{model_type}_tuning_{timestamp}_epoch_{{epoch:02d}}.keras',
-            save_best_only=False,  # Save every epoch
+            save_best_only=False,
             save_weights_only=False,
             verbose=1
         )
@@ -5066,42 +5137,34 @@ class ClinicalPredictionModel:
         # Prepare sample weights if dealing with imbalanced data
         if model_type == 'binary':
             # Class weights for binary imbalanced problems
-            if len(np.unique(y_train)) <= 2:  # Binary classification
-                pos_count = np.sum(y_train)
-                neg_count = len(y_train) - pos_count
+            # Fix 3: Use flattened version of y_train for calculating class weights
+            y_flat = y_train.flatten() if len(y_train.shape) > 1 else y_train
+            pos_count = np.sum(y_flat)
+            neg_count = len(y_flat) - pos_count
+            
+            if pos_count > 0 and neg_count > 0:
+                # Calculate class weights
+                weight_ratio = neg_count / pos_count
+                class_weight = {0: 1.0, 1: min(5.0, weight_ratio)}  # Cap at 5x to prevent extreme weights
+                print(f"Using class weights: {class_weight}")
                 
-                if pos_count > 0 and neg_count > 0:
-                    # Calculate class weights
-                    weight_ratio = neg_count / pos_count
-                    class_weight = {0: 1.0, 1: min(5.0, weight_ratio)}  # Cap at 5x to prevent extreme weights
-                    print(f"Using class weights: {class_weight}")
-                    
-                    # Search with class weights
-                    tuner.search(
-                        X_train, y_train,
-                        validation_data=(X_val, y_val),
-                        epochs=tuning_epochs,
-                        callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
-                        class_weight=class_weight,
-                        verbose=1
-                    )
-                else:
-                    # Handle edge case where one class has zero examples
-                    print("Warning: One class has zero examples. Proceeding without class weights.")
-                    tuner.search(
-                        X_train, y_train, 
-                        validation_data=(X_val, y_val),
-                        epochs=tuning_epochs,
-                        callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
-                        verbose=1
-                    )
+                # Search with class weights
+                tuner.search(
+                    X_train, y_train,
+                    validation_data=(X_val, y_val),
+                    epochs=tuning_epochs,
+                    callbacks=[early_stopping, checkpoint_callback],
+                    class_weight=class_weight,
+                    verbose=1
+                )
             else:
-                # Not a binary problem, proceed without class weights
+                # Handle edge case where one class has zero examples
+                print("Warning: One class has zero examples. Proceeding without class weights.")
                 tuner.search(
                     X_train, y_train, 
                     validation_data=(X_val, y_val),
                     epochs=tuning_epochs,
-                    callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
+                    callbacks=[early_stopping, checkpoint_callback],
                     verbose=1
                 )
         else:
@@ -5116,7 +5179,7 @@ class ClinicalPredictionModel:
                 X_train, y_train,
                 validation_data=(X_val, y_val),
                 epochs=tuning_epochs,
-                callbacks=[early_stopping, checkpoint_callback],  # Added checkpoint_callback
+                callbacks=[early_stopping, checkpoint_callback],
                 sample_weight=sample_weights,
                 verbose=1
             )
@@ -5147,10 +5210,11 @@ class ClinicalPredictionModel:
             verbose=1
         )
         
-        # Train final model with best hyperparameters
-        if model_type == 'binary' and len(np.unique(y_train)) <= 2:
-            pos_count = np.sum(y_train)
-            neg_count = len(y_train) - pos_count
+        # Fix 4: Make sure to use the same class weight calculation for final model training
+        if model_type == 'binary':
+            y_flat = y_train.flatten() if len(y_train.shape) > 1 else y_train
+            pos_count = np.sum(y_flat)
+            neg_count = len(y_flat) - pos_count
             
             if pos_count > 0 and neg_count > 0:
                 weight_ratio = neg_count / pos_count
@@ -5250,7 +5314,7 @@ class ClinicalPredictionModel:
         }
 
 
-    def enhanced_feature_selection(self, X, y, feature_names, n_features_range=(5, 50, 5), method='ensemble', 
+    def enhanced_feature_selection(self, X, y, feature_names, n_features_range=(5, 80, 5), method='ensemble', 
                             n_folds=5, plot_results=True, eval_method='cv'):
         """
         Perform enhanced feature selection using multiple advanced methods and find optimal feature count
@@ -5715,7 +5779,7 @@ class ClinicalPredictionModel:
             # Perform feature selection
             selection_result = self.enhanced_feature_selection(
                 X_boot, y_boot, feature_names, 
-                n_features_range=(5, 50, 5), method=method,
+                n_features_range=(5, 80, 5), method=method,
                 plot_results=False
             )
             
