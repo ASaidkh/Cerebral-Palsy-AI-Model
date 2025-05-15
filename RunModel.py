@@ -53,6 +53,7 @@ def main():
 
 
         pipeline_results = predictor.run_optimized_pipeline()
+        #pipeline_results = predictor.run_pipeline()
         
         if not pipeline_results:
             print("Pipeline failed to complete successfully.")

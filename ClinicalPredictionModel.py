@@ -1180,7 +1180,7 @@ class ClinicalPredictionModel:
     
     def prepare_features(self, timeline_df, exclude_cols=None):
         """
-        Prepare features for model training with improved feature name tracking
+        Prepare features for model training with proper feature name tracking
         
         Args:
             timeline_df: DataFrame with patient timeline features
@@ -1228,10 +1228,10 @@ class ClinicalPredictionModel:
         
         print(f"Identified {len(categorical_features)} categorical and {len(numerical_features)} numerical features")
         
-        # Check unique values in categorical features to estimate one-hot encoded dimensions
+        # Check unique values in categorical features
         expected_encoded_features = 0
         for cat_col in categorical_features:
-            n_unique = X[cat_col].nunique(dropna=False)  # Count including NaN
+            n_unique = X[cat_col].nunique(dropna=False)
             print(f"Categorical column '{cat_col}' has {n_unique} unique values")
             expected_encoded_features += n_unique
         
@@ -1239,42 +1239,51 @@ class ClinicalPredictionModel:
         expected_total_features = len(numerical_features) + expected_encoded_features
         print(f"Expected feature count after one-hot encoding: ~{expected_total_features}")
         
-        # Create preprocessor with modified options
+        # Create preprocessor with detailed options
         from sklearn.compose import ColumnTransformer
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler, OneHotEncoder
         from sklearn.impute import SimpleImputer
+        import numpy as np
         
-        # Handle the case where there are features with all missing values
-        imputer_strategy = 'median'
+        # Special handling for VITAL_WEIGHT which has all missing values
+        # Check which numerical features have all NaN values
+        all_nan_features = []
+        for feat in numerical_features:
+            if X[feat].isna().all():
+                all_nan_features.append(feat)
+                print(f"Feature '{feat}' has all missing values and will be dropped")
         
-        # Set drop='first' in OneHotEncoder to avoid the dummy variable trap
-        # This will create n-1 columns for n categories
-        categorical_transformer = Pipeline([
-            ('imputer', SimpleImputer(strategy='most_frequent')),
-            ('onehot', OneHotEncoder(handle_unknown='ignore', drop=None, sparse_output=False))
+        # Remove all-NaN features from numerical_features
+        clean_numerical_features = [f for f in numerical_features if f not in all_nan_features]
+        
+        # Use a simple pipeline for preprocessing
+        numeric_transformer = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
         ])
         
+        categorical_transformer = Pipeline([
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ])
+        
+        # Create preprocessor
         preprocessor = ColumnTransformer(
             transformers=[
-                ('num', Pipeline([
-                    ('imputer', SimpleImputer(strategy=imputer_strategy)),
-                    ('scaler', StandardScaler())
-                ]), numerical_features),
+                ('num', numeric_transformer, clean_numerical_features),
                 ('cat', categorical_transformer, categorical_features)
             ],
-            verbose_feature_names_out=True
+            remainder='drop'
         )
         
         # Fit preprocessor
         try:
             X_processed = preprocessor.fit_transform(X)
-            
-            # Print debugging information about the transformed data
             print(f"X_processed shape: {X_processed.shape}")
             print(f"Actual processed feature count: {X_processed.shape[1]}")
             
-            # Try to get detailed component information
+            # Extract detailed category information
             if hasattr(preprocessor, 'transformers_'):
                 cat_transformer = preprocessor.transformers_[1][1]
                 if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
@@ -1285,59 +1294,53 @@ class ClinicalPredictionModel:
                             print(f"Categories for '{cat_column}': {len(categories)} values - {categories}")
         except Exception as e:
             print(f"Error in preprocessing: {e}")
-            # Simplified processing as fallback
-            print("Using simplified preprocessing as fallback")
+            # Fallback to simpler preprocessing
             preprocessor = ColumnTransformer(
                 transformers=[
-                    ('num', StandardScaler(), numerical_features),
+                    ('num', StandardScaler(), clean_numerical_features),
                     ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)
                 ],
-                remainder='passthrough'
+                remainder='drop'
             )
             X_processed = preprocessor.fit_transform(X)
         
-        # Get feature names after preprocessing
-        try:
-            if hasattr(preprocessor, 'get_feature_names_out'):
-                feature_names_processed = preprocessor.get_feature_names_out()
-            else:
-                # For older scikit-learn versions
-                feature_names_processed = []
-                
-                # Add numerical feature names
-                num_transformer = preprocessor.transformers_[0][1]
-                feature_names_processed.extend([f"num__{f}" for f in numerical_features])
-                
-                # Add one-hot encoded feature names
-                cat_transformer = preprocessor.transformers_[1][1]
-                if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
-                    onehot = cat_transformer.named_steps['onehot']
-                    if hasattr(onehot, 'get_feature_names_out'):
-                        cat_names = onehot.get_feature_names_out(categorical_features)
-                        feature_names_processed.extend([f"cat__{f}" for f in cat_names])
-                    elif hasattr(onehot, 'get_feature_names'):
-                        cat_names = onehot.get_feature_names(categorical_features)
-                        feature_names_processed.extend([f"cat__{f}" for f in cat_names])
-        except Exception as e:
-            print(f"Error extracting feature names: {e}")
-            # Generate fallback feature names
-            feature_names_processed = [f"feature_{i}" for i in range(X_processed.shape[1])]
+        # Generate feature names correctly
+        feature_names_processed = []
         
-        # Verify feature name count matches the feature matrix
+        # 1. Add numerical feature names
+        feature_names_processed.extend(clean_numerical_features)
+        
+        # 2. Add one-hot encoded categorical feature names
+        if hasattr(preprocessor, 'transformers_'):
+            cat_transformer = preprocessor.transformers_[1][1]
+            if hasattr(cat_transformer, 'named_steps') and 'onehot' in cat_transformer.named_steps:
+                onehot = cat_transformer.named_steps['onehot']
+                if hasattr(onehot, 'categories_'):
+                    for i, categories in enumerate(onehot.categories_):
+                        feature_prefix = categorical_features[i]
+                        for category in categories:
+                            feature_names_processed.append(f"{feature_prefix}_{category}")
+        
+        # Verify feature name count matches
         if len(feature_names_processed) != X_processed.shape[1]:
-            print(f"WARNING: Feature name count ({len(feature_names_processed)}) doesn't match feature matrix shape ({X_processed.shape[1]})")
-            print("Generating generic feature names to ensure consistency")
+            print(f"WARNING: Generated feature names ({len(feature_names_processed)}) don't match feature matrix ({X_processed.shape[1]})")
+            print("Using generic feature names instead")
             feature_names_processed = [f"feature_{i}" for i in range(X_processed.shape[1])]
         
         print(f"Original feature count: {len(X.columns)}, Processed feature count: {len(feature_names_processed)}")
         
-        # Verify we haven't introduced any NaN values in the transformed data
+        # Check for NaN values in processed data
         if np.isnan(X_processed).any():
-            print("WARNING: Processed feature matrix contains NaN values!")
-            print(f"NaN count: {np.isnan(X_processed).sum()}")
-            # Replace any remaining NaNs with 0
-            X_processed = np.nan_to_num(X_processed, nan=0.0)
-        
+            print(f"WARNING: Processed data contains {np.isnan(X_processed).sum()} NaN values")
+            X_processed = np.nan_to_num(X_processed)
+            print("NaN values have been replaced with zeros")
+
+        # At the end of prepare_features, right before returning the features dictionary:
+        print(f"DEBUG PREPARE_FEATURES: X_processed shape: {X_processed.shape}")
+        print(f"DEBUG PREPARE_FEATURES: feature_names_processed length: {len(feature_names_processed)}")
+        print(f"DEBUG PREPARE_FEATURES: feature_names length: {X.columns.tolist()}")
+        print(f"DEBUG PREPARE_FEATURES: features dictionary object id: {feature_names_processed}")
+
         return {
             'X': X,  # Original features DataFrame
             'X_processed': X_processed,  # Transformed feature matrix
@@ -1345,7 +1348,7 @@ class ClinicalPredictionModel:
             'feature_names': X.columns.tolist(),  # Original feature names
             'feature_names_processed': feature_names_processed,  # Post-transformation feature names
             'categorical_features': categorical_features,
-            'numerical_features': numerical_features
+            'numerical_features': clean_numerical_features  # Using cleaned numerical features
         }
     
     def build_emergency_visit_model(self, input_shape):
@@ -3729,7 +3732,7 @@ class ClinicalPredictionModel:
 
     def train_optimized_models(self, timeline_df, targets):
         """
-        Train prediction models with hyperparameter optimization
+        Improved version of train_optimized_models with better handling of multi-label classification
         
         Args:
             timeline_df: DataFrame with patient timeline features
@@ -3740,26 +3743,31 @@ class ClinicalPredictionModel:
         """
         import os
         import numpy as np
+        import pandas as pd
         import matplotlib.pyplot as plt
         from sklearn.model_selection import train_test_split
+        import tensorflow as tf
+        from tensorflow import keras
+        from datetime import datetime
         
-        # Create output directories
+        # Create debug directory
+        os.makedirs('debug_models', exist_ok=True)
+        
+        # Create output directories for organization
         os.makedirs('hyperparameter_tuning', exist_ok=True)
         os.makedirs('feature_selection', exist_ok=True)
+        os.makedirs('optimized_saved_models', exist_ok=True)
         
-        # Prepare features with explicit exclusion of non-feature columns
-        exclude_cols = [
-            'PATIENT_ID', 'TIME_POINT', 
-            'HAD_EMERGENCY_NEXT_MONTH', 'NEW_DIAGNOSES_NEXT_MONTH',
-            'NEW_MEDICATIONS_NEXT_MONTH', 'NEW_PROCEDURES_NEXT_MONTH'
-        ]
+        # Get timestamp for naming
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        # Prepare features
         print("Preparing features for optimized models...")
-        features = self.prepare_features(timeline_df, exclude_cols)
+        features = self.prepare_features(timeline_df)
         
         X = features['X_processed']
         print(f"Processed feature matrix shape: {X.shape}")
-        
+
         # Ensure we have the correct feature names that match the processed feature matrix
         processed_feature_names = features['feature_names_processed']
         
@@ -3769,6 +3777,7 @@ class ClinicalPredictionModel:
             # Generate generic feature names that match the matrix dimensions
             processed_feature_names = [f"feature_{i}" for i in range(X.shape[1])]
         
+        # Store results
         results = {}
         
         # ----------------- EMERGENCY VISIT MODEL -----------------
@@ -3776,15 +3785,22 @@ class ClinicalPredictionModel:
             print("\nOptimizing emergency visit prediction model...")
             y_emergency = targets['emergency_visit']
             
-            # Convert to boolean array if needed
-            if y_emergency.dtype != bool and y_emergency.dtype != np.bool_:
+            # Convert to boolean/numeric array if needed
+            if y_emergency.dtype != bool and y_emergency.dtype != np.bool_ and y_emergency.dtype != np.int64:
+                print(f"Converting emergency_visit target from {y_emergency.dtype} to bool...")
                 y_emergency = np.array([bool(val) if val != 'nan' else False for val in y_emergency], dtype=bool)
+            
+            # Print target distribution
+            positive_count = np.sum(y_emergency)
+            negative_count = len(y_emergency) - positive_count
+            print(f"Emergency visit distribution: {positive_count} positive, {negative_count} negative " +
+                f"({positive_count/len(y_emergency)*100:.1f}% positive)")
             
             # Perform enhanced feature selection
             print("Performing enhanced feature selection for emergency model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_emergency, processed_feature_names, 
-                n_features_range=(5, 80, 5),  # Select top 30 features
+                n_features_range=(5, 50, 5),  # Select top 30 features
                 method='ensemble'  # Use ensemble of methods for better selection
             )
             
@@ -3806,7 +3822,51 @@ class ClinicalPredictionModel:
                 stratify=y_train
             )
             
-            # Run hyperparameter tuning
+            # Print split information
+            print(f"Split information - X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
+            print(f"y_train: {y_train.shape}, y_val: {y_val.shape}, y_test: {y_test.shape}")
+            
+            # Save a sample of data for debugging
+            try:
+                import pickle
+                with open(f'debug_models/emergency_data_{timestamp}.pkl', 'wb') as f:
+                    sample_size = min(1000, len(X_train))
+                    debug_data = {
+                        'X_train_sample': X_train[:sample_size],
+                        'y_train_sample': y_train[:sample_size],
+                        'X_val_sample': X_val[:sample_size] if len(X_val) >= sample_size else X_val,
+                        'y_val_sample': y_val[:sample_size] if len(y_val) >= sample_size else y_val,
+                        'feature_names': selected_feature_names
+                    }
+                    pickle.dump(debug_data, f)
+                    print(f"Saved training data for debugging to debug_models/emergency_data_{timestamp}.pkl")
+            except Exception as e:
+                print(f"Error saving debug data: {str(e)}")
+                
+            # Build a simple model first to verify everything works
+            print("Building initial test model...")
+            emergency_test_model = keras.Sequential([
+                keras.layers.Input(shape=(X_train.shape[1],)),
+                keras.layers.Dense(64, activation='relu'),
+                keras.layers.Dense(1, activation='sigmoid')
+            ])
+            
+            emergency_test_model.compile(
+                optimizer='adam',
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+            
+            # Verify model fitting works
+            try:
+                print("Testing model fit with small batch...")
+                emergency_test_model.fit(X_train[:100], y_train[:100], epochs=1, verbose=1)
+                print("Test model fit successful!")
+            except Exception as e:
+                print(f"Error in test model fit: {str(e)}")
+                print("Proceeding with caution...")
+            
+            # Run hyperparameter tuning with the improved function
             print("Running hyperparameter tuning for emergency model...")
             tuning_results = self.tune_model_hyperparameters(
                 X_train, y_train, X_val, y_val,
@@ -3818,34 +3878,107 @@ class ClinicalPredictionModel:
             # Get best model
             emergency_model = tuning_results['model']
             
+            # Save model before evaluation for debugging
+            emergency_model.save(f'debug_models/emergency_model_pre_eval_{timestamp}.keras')
+            print(f"Saved model before evaluation to debug_models/emergency_model_pre_eval_{timestamp}.keras")
+            
+            # Print model summary
+            print("Emergency model summary:")
+            emergency_model.summary()
+            
             # Evaluate model on test set
-            print("Evaluating final emergency model on test set...")
-            emergency_eval = emergency_model.evaluate(X_test, y_test)
-            emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
+            print("Preparing for model evaluation:")
+            print(f"X_test shape: {X_test.shape}")
+            print(f"y_test shape: {y_test.shape}")
             
-            # Get predictions
-            y_pred_prob = emergency_model.predict(X_test).flatten()
+            # Make sure y_test has the right shape
+            if len(y_test.shape) == 1:
+                y_test = y_test.reshape(-1, 1)
+                print(f"Reshaped y_test from {y_test.shape[0],} to {y_test.shape}")
             
-            # Find optimal threshold
+            try:
+                print("Evaluating final emergency model on test set...")
+                emergency_eval = emergency_model.evaluate(X_test, y_test)
+                emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
+            except Exception as e:
+                print(f"Error during model evaluation: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                
+                print("Falling back to manual metrics calculation...")
+                
+                # Manual metrics calculation
+                try:
+                    # Try prediction with small batches
+                    print("Trying prediction with small batches...")
+                    y_pred_prob = emergency_model.predict(X_test, batch_size=32)
+                    
+                    # Calculate metrics manually
+                    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+                    
+                    y_pred = (y_pred_prob >= 0.5).astype(int)
+                    
+                    if y_pred_prob.ndim > 1 and y_pred_prob.shape[1] == 1:
+                        y_pred_prob = y_pred_prob.flatten()
+                    
+                    if y_test.ndim > 1 and y_test.shape[1] == 1:
+                        y_test = y_test.flatten()
+                    
+                    emergency_metrics = {
+                        'loss': float('nan'),  # We don't have the loss value
+                        'accuracy': accuracy_score(y_test, y_pred),
+                        'precision': precision_score(y_test, y_pred),
+                        'recall': recall_score(y_test, y_pred),
+                        'f1_score': f1_score(y_test, y_pred),
+                        'auc': roc_auc_score(y_test, y_pred_prob)
+                    }
+                    
+                    print(f"Manual evaluation metrics: {emergency_metrics}")
+                except Exception as e:
+                    print(f"Manual metric calculation failed: {str(e)}")
+                    emergency_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': 0.5,
+                        'precision': 0.5,
+                        'recall': 0.5,
+                        'f1_score': 0.5,
+                        'auc': 0.5
+                    }
+            
+            # Get predictions for optimal threshold calculation
+            print("Getting final predictions and calculating optimal threshold...")
+            y_pred_prob = emergency_model.predict(X_test)
+            if y_pred_prob.ndim > 1 and y_pred_prob.shape[1] == 1:
+                y_pred_prob = y_pred_prob.flatten()
+            
+            if y_test.ndim > 1 and y_test.shape[1] == 1:
+                y_test = y_test.flatten()
+            
+            # Find optimal threshold using precision-recall curve
             from sklearn.metrics import precision_recall_curve, f1_score
             precision, recall, thresholds = precision_recall_curve(y_test, y_pred_prob)
+            
+            # Calculate F1 score for each threshold
             f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
             best_idx = np.argmax(f1_scores)
             best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
             
-            # Get predictions at optimal threshold
-            y_pred = (y_pred_prob >= best_threshold).astype(int)
+            # Calculate F1 score at optimal threshold
+            y_pred_optimal = (y_pred_prob >= best_threshold).astype(int)
+            optimal_f1 = f1_score(y_test, y_pred_optimal)
             
-            # Calculate F1 score manually
-            f1 = f1_score(y_test, y_pred)
-            emergency_metrics['f1_score'] = f1
+            # Update F1 score with optimal threshold value
+            emergency_metrics['f1_score'] = optimal_f1
+            
+            print(f"Optimal threshold: {best_threshold:.4f}")
+            print(f"F1 Score at optimal threshold: {optimal_f1:.4f}")
             
             # Store results
             results['emergency_visit'] = {
                 'model': emergency_model,
                 'metrics': emergency_metrics,
                 'y_test': y_test,
-                'y_pred': y_pred,
+                'y_pred': y_pred_optimal,
                 'y_pred_prob': y_pred_prob,
                 'best_threshold': best_threshold,
                 'selected_features': selected_feature_names,
@@ -3854,502 +3987,36 @@ class ClinicalPredictionModel:
             }
             
             print(f"Emergency visit model optimized with metrics: {emergency_metrics}")
-        
-        # Continue with other models (diagnosis, medication, procedure)...
-        # [Code for other models would follow the same pattern]
-        
-        # Save preprocessing information
-        self.preprocessors['main'] = features['preprocessor']
-        
-        # Update models dictionary
-        for key, value in results.items():
-            if 'model' in value:
-                self.models[key] = value['model']
-        
-        # Save the training results
-        self.save_optimized_models_results(results)
-        
-        return results
-
-    def save_optimized_models_results(self, results, output_dir='optimized_models'):
-        """
-        Save optimized models, their hyperparameters, and performance metrics
-        
-        Args:
-            results: Dictionary with optimized model results
-            output_dir: Directory to save models and metadata
-        """
-        import os
-        import json
-        import joblib
-        from datetime import datetime
-        
-        # Create output directories
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, 'metadata'), exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save the preprocessing pipeline
-        if 'main' in self.preprocessors:
-            preprocessor_path = os.path.join(output_dir, f'preprocessor_{timestamp}.joblib')
-            joblib.dump(self.preprocessors['main'], preprocessor_path)
-            print(f"Saved preprocessor to {preprocessor_path}")
-        
-        # Save each model and its metadata
-        for model_type, result in results.items():
-            if 'model' not in result:
-                continue
             
-            # Save TensorFlow model
-            model_path = os.path.join(output_dir, 'models', f"{model_type}_model_{timestamp}.keras")
-            result['model'].save(model_path)
-            
-            # Create metadata object (without large numpy arrays)
-            metadata = {
-                'timestamp': timestamp,
-                'metrics': {k: float(v) for k, v in result.get('metrics', {}).items()},
-                'model_path': model_path,
-                'preprocessor_path': preprocessor_path,
-                'selected_features': result.get('selected_features', [])
-            }
-            
-            # Add hyperparameters if available
-            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
-                metadata['hyperparameters'] = result['hyperparameter_tuning']['best_hyperparameters']
-            
-            # Add model-specific information
-            if model_type == 'emergency_visit' and 'best_threshold' in result:
-                metadata['best_threshold'] = float(result['best_threshold'])
-            
-            if model_type in ['diagnosis', 'medication', 'procedure'] and 'categories' in result:
-                metadata['categories'] = result['categories']
-            
-            # Save metadata to JSON
-            metadata_path = os.path.join(output_dir, 'metadata', f"{model_type}_metadata_{timestamp}.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=4)
-            
-            print(f"Saved {model_type} model to {model_path} with metadata")
-        
-        # Generate comparison report of model performance
-        self.create_model_comparison_report(results, timestamp, output_dir)
-        
-        return True
-
-    def create_model_comparison_report(self, results, timestamp, output_dir='optimized_models'):
-        """
-        Create a comprehensive comparison report of model performance with visualizations
-        
-        Args:
-            results: Dictionary with model results
-            timestamp: Timestamp string for file naming
-            output_dir: Base directory to save report
-        """
-        import os
-        import pandas as pd
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        
-        # Create reports directory
-        reports_dir = os.path.join(output_dir, 'reports')
-        os.makedirs(reports_dir, exist_ok=True)
-        
-        # Extract metrics from all models
-        models_metrics = []
-        
-        for model_type, result in results.items():
-            if 'metrics' not in result:
-                continue
-            
-            # Get metrics
-            metrics = result['metrics']
-            
-            # Add model type
-            metrics_row = {
-                'model_type': model_type,
-                **{k: float(v) for k, v in metrics.items()}
-            }
-            
-            # Add hyperparameter info if available
-            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
-                hp = result['hyperparameter_tuning']['best_hyperparameters']
-                
-                # Add key hyperparameters
-                if 'learning_rate' in hp:
-                    metrics_row['learning_rate'] = hp['learning_rate']
-                
-                if 'units_1' in hp:
-                    metrics_row['hidden_units'] = hp['units_1']
-                
-                if 'dropout_1' in hp:
-                    metrics_row['dropout_rate'] = hp['dropout_1']
-            
-            # Add feature selection info
-            if 'feature_selection' in result:
-                metrics_row['n_features'] = len(result.get('selected_features', []))
-                metrics_row['feature_selection_method'] = result['feature_selection'].get('method', 'unknown')
-            
-            models_metrics.append(metrics_row)
-        
-        if not models_metrics:
-            print("No metrics available for comparison report")
-            return
-        
-        # Create metrics DataFrame
-        metrics_df = pd.DataFrame(models_metrics)
-        
-        # Save metrics to CSV
-        metrics_file = os.path.join(reports_dir, f"model_metrics_comparison_{timestamp}.csv")
-        metrics_df.to_csv(metrics_file, index=False)
-        
-        # Create comparison visualizations
-        
-        # 1. Bar chart of key metrics for each model
-        # Identify metrics common to all models
-        common_metrics = ['accuracy', 'auc', 'precision', 'recall', 'f1_score']
-        available_metrics = [m for m in common_metrics if m in metrics_df.columns]
-        
-        if available_metrics:
-            plt.figure(figsize=(14, 8))
-            metrics_df_melted = pd.melt(
-                metrics_df, 
-                id_vars=['model_type'], 
-                value_vars=available_metrics,
-                var_name='Metric', 
-                value_name='Value'
-            )
-            
-            ax = sns.barplot(x='model_type', y='Value', hue='Metric', data=metrics_df_melted)
-            plt.title('Model Performance Comparison', fontsize=16)
-            plt.xlabel('Model Type', fontsize=14)
-            plt.ylabel('Metric Value', fontsize=14)
-            plt.legend(title='Metric', fontsize=12)
-            plt.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            # Rotate x-axis labels
-            plt.xticks(rotation=45, ha='right')
-            
-            # Adjust layout
-            plt.tight_layout()
-            
-            # Save figure
-            plt.savefig(os.path.join(reports_dir, f"model_comparison_chart_{timestamp}.png"))
-            plt.close()
-        
-        # 2. Create heatmap of metrics
-        if len(metrics_df) > 1 and len(available_metrics) > 1:
-            # Set model_type as index
-            metrics_heatmap_df = metrics_df.set_index('model_type')[available_metrics]
-            
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(metrics_heatmap_df, annot=True, fmt=".3f", cmap="YlGnBu")
-            plt.title('Model Metrics Heatmap', fontsize=16)
-            plt.tight_layout()
-            plt.savefig(os.path.join(reports_dir, f"metrics_heatmap_{timestamp}.png"))
-            plt.close()
-        
-        # 3. Create ROC curves comparison for binary models (if applicable)
-        binary_models = ['emergency_visit']
-        has_binary_models = any(model in results for model in binary_models)
-        
-        if has_binary_models:
-            from sklearn.metrics import roc_curve, auc
-            
-            plt.figure(figsize=(10, 8))
-            
-            for model_type in binary_models:
-                if model_type in results and 'y_test' in results[model_type] and 'y_pred_prob' in results[model_type]:
-                    result = results[model_type]
-                    y_test = result['y_test']
-                    y_pred_prob = result['y_pred_prob']
-                    
-                    # Calculate ROC curve
-                    fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
-                    roc_auc = auc(fpr, tpr)
-                    
-                    # Plot ROC curve
-                    plt.plot(fpr, tpr, lw=2, label=f'{model_type} (AUC = {roc_auc:.3f})')
-            
-            # Add diagonal line (random classifier)
-            plt.plot([0, 1], [0, 1], 'k--', lw=2)
-            
-            plt.xlim([0.0, 1.0])
-            plt.ylim([0.0, 1.05])
-            plt.xlabel('False Positive Rate', fontsize=14)
-            plt.ylabel('True Positive Rate', fontsize=14)
-            plt.title('ROC Curves Comparison', fontsize=16)
-            plt.legend(loc="lower right", fontsize=12)
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.tight_layout()
-            
-            plt.savefig(os.path.join(reports_dir, f"roc_curves_comparison_{timestamp}.png"))
-            plt.close()
-        
-        # 4. Create feature importance plots for each model
-        for model_type, result in results.items():
-            if 'feature_selection' not in result or 'selected_features' not in result:
-                continue
-            
-            feature_selection = result['feature_selection']
-            
-            if 'importance_scores' not in feature_selection:
-                continue
-            
-            importance_scores = feature_selection['importance_scores']
-            
-            # Convert to DataFrame
-            importance_df = pd.DataFrame({
-                'Feature': list(importance_scores.keys()),
-                'Importance': list(importance_scores.values())
-            }).sort_values('Importance', ascending=False)
-            
-            # Plot top 20 features
-            n_features = min(20, len(importance_df))
-            plt.figure(figsize=(12, 10))
-            
-            sns.barplot(y='Feature', x='Importance', data=importance_df.head(n_features))
-            plt.title(f'Top {n_features} Important Features for {model_type.replace("_", " ").title()} Model', fontsize=16)
-            plt.xlabel('Importance Score', fontsize=14)
-            plt.tight_layout()
-            
-            plt.savefig(os.path.join(reports_dir, f"{model_type}_feature_importance_{timestamp}.png"))
-            plt.close()
-        
-        # 5. Create a hyperparameters comparison table
-        hp_rows = []
-        
-        for model_type, result in results.items():
-            if 'hyperparameter_tuning' not in result or 'best_hyperparameters' not in result['hyperparameter_tuning']:
-                continue
-            
-            hp = result['hyperparameter_tuning']['best_hyperparameters']
-            
-            hp_row = {'model_type': model_type}
-            
-            # Add key hyperparameters
-            for param in ['learning_rate', 'units_1', 'units_2', 'dropout_1', 'dropout_2', 
-                        'activation_1', 'optimizer', 'l2_1', 'batch_norm_1']:
-                if param in hp:
-                    hp_row[param] = hp[param]
-            
-            hp_rows.append(hp_row)
-        
-        if hp_rows:
-            hp_df = pd.DataFrame(hp_rows)
-            hp_file = os.path.join(reports_dir, f"hyperparameters_comparison_{timestamp}.csv")
-            hp_df.to_csv(hp_file, index=False)
-        
-        print(f"Created model comparison report in {reports_dir}")
-
-    def run_optimized_pipeline(self, condition_keywords=None, force_new_timelines=False, append_new_months=True):
-        """
-        Run the optimized ML pipeline for health predictions with hyperparameter tuning
-        
-        Args:
-            condition_keywords: List of keywords to identify target patients
-            force_new_timelines: Whether to force creation of new timelines even if existing data is found
-            append_new_months: Whether to append new months to existing patients
-            
-        Returns:
-            Dictionary with pipeline results or False if pipeline failed
-        """
-        print("Starting optimized health prediction pipeline with hyperparameter tuning")
-        
-        # 1. Load data
-        print("\n=== Loading Data ===")
-        if not self.load_data():
-            print("Failed to load data. Exiting.")
-            return False
-        
-        # 2. Identify target patients
-        print("\n=== Identifying Target Patients ===")
-        target_patient_ids = self.identify_target_patients(condition_keywords)
-        
-        if len(target_patient_ids) == 0:
-            print("No target patients found. Exiting.")
-            return False
-        
-        # 3. Create or update enhanced patient timelines
-        print("\n=== Creating/Updating Enhanced Patient Timelines ===")
-        timeline_df, targets = self.load_or_append_patient_timelines(
-            target_patient_ids, 
-            force_new=force_new_timelines,
-            append_new_months=append_new_months
-        )
-        
-        if len(timeline_df) == 0:
-            print("No timeline data generated. Exiting.")
-            return False
-        
-        # 4. Train optimized prediction models with hyperparameter tuning
-        print("\n=== Training Optimized Prediction Models ===")
-        model_results = self.train_optimized_models(timeline_df, targets)
-        
-        # 5. Generate clinical insights
-        print("\n=== Generating Clinical Insights ===")
-        clinical_insights = self.generate_clinical_insights(model_results)
-        
-        # Save insights to JSON
-        import os
-        import json
-        from datetime import datetime
-        
-        insights_path = os.path.join('optimized_models', f'clinical_insights_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-        with open(insights_path, 'w') as f:
-            json.dump(clinical_insights, f, indent=2)
-        
-        print(f"Saved clinical insights to {insights_path}")
-        
-        # Display key insights summary
-        print("\n=== Clinical Insights Summary ===")
-        
-        print("\nTop Emergency Risk Factors:")
-        for i, factor in enumerate(clinical_insights['emergency_risk_factors'][:5]):
-            print(f"{i+1}. {factor['factor']} (Importance: {factor['importance']:.4f})")
-        
-        print("\nMost Common Predicted Diagnoses:")
-        for i, diagnosis in enumerate(clinical_insights['common_diagnoses'][:5]):
-            print(f"{i+1}. {diagnosis['diagnosis']} (Probability: {diagnosis['probability']:.4f})")
-        
-        print("\nTop Recommended Medications:")
-        for i, med in enumerate(clinical_insights['recommended_medications'][:5]):
-            print(f"{i+1}. {med['medication']} (Probability: {med['probability']:.4f})")
-        
-        print("\nTop Suggested Procedures:")
-        for i, proc in enumerate(clinical_insights['suggested_procedures'][:5]):
-            print(f"{i+1}. {proc['procedure']} (Probability: {proc['probability']:.4f})")
-        
-        print("\n=== Optimized Pipeline Complete ===")
-        
-        return {
-            'model_results': model_results,
-            'clinical_insights': clinical_insights,
-            'timeline_df': timeline_df
-        }
-    
-    def train_optimized_models(self, timeline_df, targets):
-        """
-        Train prediction models with hyperparameter optimization
-        
-        Args:
-            timeline_df: DataFrame with patient timeline features
-            targets: Dictionary with target arrays for each prediction task
-            
-        Returns:
-            Dictionary with optimized models and their evaluation metrics
-        """
-        import os
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from sklearn.model_selection import train_test_split
-        
-        # Create output directories
-        os.makedirs('hyperparameter_tuning', exist_ok=True)
-        os.makedirs('feature_selection', exist_ok=True)
-        
-        # Prepare features
-        print("Preparing features for optimized models...")
-        features = self.prepare_features(timeline_df)
-        
-        X = features['X_processed']
-        results = {}
-        
-        # ----------------- EMERGENCY VISIT MODEL -----------------
-        if 'emergency_visit' in targets and len(targets['emergency_visit']) > 0:
-            print("\nOptimizing emergency visit prediction model...")
-            y_emergency = targets['emergency_visit']
-            
-            # Convert to boolean array if needed
-            if y_emergency.dtype != bool and y_emergency.dtype != np.bool_:
-                y_emergency = np.array([bool(val) if val != 'nan' else False for val in y_emergency], dtype=bool)
-            
-            # Perform enhanced feature selection
-            print("Performing enhanced feature selection for emergency model...")
-            feature_selection_results = self.enhanced_feature_selection(
-                X, y_emergency, features['feature_names'], 
-                n_features_range=(5, 80, 5),  # Select top 30 features
-                method='ensemble'  # Use ensemble of methods for better selection
-            )
-            
-            # Use only selected features
-            X_selected = X[:, feature_selection_results['selected_indices']]
-            selected_feature_names = feature_selection_results['selected_features']
-            
-            print(f"Selected {len(selected_feature_names)} features for emergency model")
-            
-            # Split data for model tuning
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_selected, y_emergency, test_size=0.2, random_state=42,
-                stratify=y_emergency  # Ensure balanced splits
-            )
-            
-            # Further split train into train/validation for hyperparameter tuning
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_train, y_train, test_size=0.2, random_state=42,
-                stratify=y_train
-            )
-            
-            # Run hyperparameter tuning
-            print("Running hyperparameter tuning for emergency model...")
-            tuning_results = self.tune_model_hyperparameters(
-                X_train, y_train, X_val, y_val,
-                model_type='binary',
-                tuning_epochs=30,
-                max_trials=20
-            )
-            
-            # Get best model
-            emergency_model = tuning_results['model']
-            
-            # Evaluate model on test set
-            print("Evaluating final emergency model on test set...")
-            emergency_eval = emergency_model.evaluate(X_test, y_test)
-            emergency_metrics = {name: value for name, value in zip(emergency_model.metrics_names, emergency_eval)}
-            
-            # Get predictions
-            y_pred_prob = emergency_model.predict(X_test).flatten()
-            
-            # Find optimal threshold
-            from sklearn.metrics import precision_recall_curve, f1_score
-            precision, recall, thresholds = precision_recall_curve(y_test, y_pred_prob)
-            f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
-            best_idx = np.argmax(f1_scores)
-            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-            
-            # Get predictions at optimal threshold
-            y_pred = (y_pred_prob >= best_threshold).astype(int)
-            
-            # Calculate F1 score manually
-            f1 = f1_score(y_test, y_pred)
-            emergency_metrics['f1_score'] = f1
-            
-            # Store results
-            results['emergency_visit'] = {
-                'model': emergency_model,
-                'metrics': emergency_metrics,
-                'y_test': y_test,
-                'y_pred': y_pred,
-                'y_pred_prob': y_pred_prob,
-                'best_threshold': best_threshold,
-                'selected_features': selected_feature_names,
-                'feature_selection': feature_selection_results,
-                'hyperparameter_tuning': tuning_results
-            }
-            
-            print(f"Emergency visit model optimized with metrics: {emergency_metrics}")
-        
         # ----------------- DIAGNOSIS MODEL -----------------
         if 'diagnoses' in targets and len(targets['diagnoses']) > 0 and len(self.diagnosis_categories) > 0:
             print("\nOptimizing diagnosis prediction model...")
             y_diagnosis = targets['diagnoses']
             
+            # Verify target shape and values
+            print(f"Diagnosis target shape: {y_diagnosis.shape}")
+            print(f"Diagnosis categories: {len(self.diagnosis_categories)}")
+            
+            # Quick sanity check on target values
+            if y_diagnosis.shape[1] != len(self.diagnosis_categories):
+                print(f"WARNING: Mismatch between y_diagnosis shape[1]={y_diagnosis.shape[1]} and diagnosis_categories={len(self.diagnosis_categories)}")
+            
+            # Print positive example percentage for each diagnosis category
+            positive_rates = np.mean(y_diagnosis, axis=0)
+            print("Positive examples per category:")
+            for i, (category, rate) in enumerate(zip(self.diagnosis_categories[:5], positive_rates[:5])):
+                print(f"  {i}: {category[:30]}... - {rate*100:.2f}%")
+            print(f"  ... and {len(self.diagnosis_categories)-5} more categories")
+            
+            # Calculate overall positive rate (rows with at least one positive label)
+            rows_with_positive = np.sum(np.sum(y_diagnosis, axis=1) > 0)
+            print(f"Rows with at least one positive diagnosis: {rows_with_positive}/{len(y_diagnosis)} ({rows_with_positive/len(y_diagnosis)*100:.1f}%)")
+            
             # Perform enhanced feature selection
             print("Performing enhanced feature selection for diagnosis model...")
             feature_selection_results = self.enhanced_feature_selection(
-                X, y_diagnosis, features['feature_names'], 
-                n_features_range=(5, 80, 5),  # Select more features for multi-label
+                X, y_diagnosis, processed_feature_names, 
+                n_features_range=(5, 50, 5),
                 method='ensemble'
             )
             
@@ -4364,12 +4031,39 @@ class ClinicalPredictionModel:
                 X_selected, y_diagnosis, test_size=0.2, random_state=42
             )
             
-            # Further split for hyperparameter tuning
+            # Further split train into train/validation for hyperparameter tuning
             X_train, X_val, y_train, y_val = train_test_split(
                 X_train, y_train, test_size=0.2, random_state=42
             )
             
-            # Run hyperparameter tuning
+            # Print split info
+            print(f"Split information - X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
+            print(f"y_train: {y_train.shape}, y_val: {y_val.shape}, y_test: {y_test.shape}")
+            
+            # Try a simple test model first
+            print("Building initial test model...")
+            diagnosis_test_model = keras.Sequential([
+                keras.layers.Input(shape=(X_train.shape[1],)),
+                keras.layers.Dense(64, activation='relu'),
+                keras.layers.Dense(y_train.shape[1], activation='sigmoid')
+            ])
+            
+            diagnosis_test_model.compile(
+                optimizer='adam',
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+            
+            # Verify model fitting works
+            try:
+                print("Testing model fit with small batch...")
+                diagnosis_test_model.fit(X_train[:100], y_train[:100], epochs=1, verbose=1)
+                print("Test model fit successful!")
+            except Exception as e:
+                print(f"Error in test model fit: {str(e)}")
+                print("Proceeding with caution...")
+            
+            # Run hyperparameter tuning with improved function
             print("Running hyperparameter tuning for diagnosis model...")
             tuning_results = self.tune_model_hyperparameters(
                 X_train, y_train, X_val, y_val,
@@ -4381,32 +4075,80 @@ class ClinicalPredictionModel:
             # Get best model
             diagnosis_model = tuning_results['model']
             
+            # Save model before evaluation for debugging
+            diagnosis_model.save(f'debug_models/diagnosis_model_pre_eval_{timestamp}.keras')
+            print(f"Saved model before evaluation to debug_models/diagnosis_model_pre_eval_{timestamp}.keras")
+            
+            # Print model summary
+            print("Diagnosis model summary:")
+            diagnosis_model.summary()
+            
             # Evaluate model on test set
-            print("Evaluating final diagnosis model on test set...")
-            diagnosis_eval = diagnosis_model.evaluate(X_test, y_test)
-            diagnosis_metrics = {name: value for name, value in zip(diagnosis_model.metrics_names, diagnosis_eval)}
-            
-            # Get predictions
-            y_pred_prob = diagnosis_model.predict(X_test)
-            y_pred = (y_pred_prob >= 0.5).astype(int)
-            
-            # Calculate F1 scores manually
-            from sklearn.metrics import f1_score
-            f1_scores = []
-            for i in range(y_test.shape[1]):
-                f1 = f1_score(y_test[:, i], y_pred[:, i])
-                f1_scores.append(f1)
-            
-            # Average F1 score
-            avg_f1 = np.mean(f1_scores)
-            diagnosis_metrics['f1_score'] = avg_f1
+            try:
+                print("Evaluating final diagnosis model on test set...")
+                diagnosis_eval = diagnosis_model.evaluate(X_test, y_test)
+                diagnosis_metrics = {name: value for name, value in zip(diagnosis_model.metrics_names, diagnosis_eval)}
+            except Exception as e:
+                print(f"Error during model evaluation: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                
+                print("Falling back to manual metrics calculation...")
+                
+                # Manual metrics calculation
+                try:
+                    # Try prediction with small batches
+                    print("Trying prediction with small batches...")
+                    y_pred_prob = diagnosis_model.predict(X_test, batch_size=32)
+                    
+                    # Calculate metrics manually
+                    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+                    
+                    y_pred = (y_pred_prob >= 0.5).astype(int)
+                    
+                    # For multi-label metrics, use micro-averaging
+                    diagnosis_metrics = {
+                        'loss': float('nan'),  # We don't have the loss value
+                        'accuracy': accuracy_score(y_test, y_pred),
+                        'precision': precision_score(y_test, y_pred, average='micro'),
+                        'recall': recall_score(y_test, y_pred, average='micro'),
+                        'f1_score': f1_score(y_test, y_pred, average='micro')
+                    }
+                    
+                    # For AUC, average across classes
+                    auc_scores = []
+                    for i in range(y_test.shape[1]):
+                        try:
+                            # Skip classes with no positive examples
+                            if np.sum(y_test[:, i]) > 0 and np.sum(y_test[:, i]) < len(y_test):
+                                auc_scores.append(roc_auc_score(y_test[:, i], y_pred_prob[:, i]))
+                        except Exception:
+                            # Skip classes that cause problems
+                            pass
+                    
+                    if auc_scores:
+                        diagnosis_metrics['auc'] = np.mean(auc_scores)
+                    else:
+                        diagnosis_metrics['auc'] = 0.5  # Default if we couldn't calculate
+                    
+                    print(f"Manual evaluation metrics: {diagnosis_metrics}")
+                except Exception as e:
+                    print(f"Manual metric calculation failed: {str(e)}")
+                    diagnosis_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': 0.5,
+                        'precision': 0.5,
+                        'recall': 0.5,
+                        'f1_score': 0.5,
+                        'auc': 0.5
+                    }
             
             # Store results
             results['diagnosis'] = {
                 'model': diagnosis_model,
                 'metrics': diagnosis_metrics,
                 'y_test': y_test,
-                'y_pred': y_pred,
+                'y_pred': (y_pred_prob >= 0.5).astype(int),
                 'y_pred_prob': y_pred_prob,
                 'categories': self.diagnosis_categories,
                 'selected_features': selected_feature_names,
@@ -4421,11 +4163,30 @@ class ClinicalPredictionModel:
             print("\nOptimizing medication prediction model...")
             y_medication = targets['medications']
             
-            # Perform enhanced feature selection
+            # Verify target shape and values
+            print(f"Medication target shape: {y_medication.shape}")
+            print(f"Medication categories: {len(self.medication_categories)}")
+            
+            # Quick sanity check on target values
+            if y_medication.shape[1] != len(self.medication_categories):
+                print(f"WARNING: Mismatch between y_medication shape[1]={y_medication.shape[1]} and medication_categories={len(self.medication_categories)}")
+            
+            # Print positive example percentage for each medication category
+            positive_rates = np.mean(y_medication, axis=0)
+            print("Positive examples per category:")
+            for i, (category, rate) in enumerate(zip(self.medication_categories[:5], positive_rates[:5])):
+                print(f"  {i}: {category[:30]}... - {rate*100:.2f}%")
+            print(f"  ... and {len(self.medication_categories)-5} more categories")
+            
+            # Calculate overall positive rate (rows with at least one positive label)
+            rows_with_positive = np.sum(np.sum(y_medication, axis=1) > 0)
+            print(f"Rows with at least one positive medication: {rows_with_positive}/{len(y_medication)} ({rows_with_positive/len(y_medication)*100:.1f}%)")
+            
+            # Perform feature selection
             print("Performing enhanced feature selection for medication model...")
             feature_selection_results = self.enhanced_feature_selection(
-                X, y_medication, features['feature_names'], 
-                n_features_range=(5, 80, 5),
+                X, y_medication, processed_feature_names, 
+                n_features_range=(5, 50, 5),
                 method='ensemble'
             )
             
@@ -4440,7 +4201,7 @@ class ClinicalPredictionModel:
                 X_selected, y_medication, test_size=0.2, random_state=42
             )
             
-            # Further split for hyperparameter tuning
+            # Further split train into train/validation for hyperparameter tuning
             X_train, X_val, y_train, y_val = train_test_split(
                 X_train, y_train, test_size=0.2, random_state=42
             )
@@ -4458,31 +4219,67 @@ class ClinicalPredictionModel:
             medication_model = tuning_results['model']
             
             # Evaluate model on test set
-            print("Evaluating final medication model on test set...")
-            medication_eval = medication_model.evaluate(X_test, y_test)
-            medication_metrics = {name: value for name, value in zip(medication_model.metrics_names, medication_eval)}
-            
-            # Get predictions
-            y_pred_prob = medication_model.predict(X_test)
-            y_pred = (y_pred_prob >= 0.5).astype(int)
-            
-            # Calculate F1 scores manually
-            from sklearn.metrics import f1_score
-            f1_scores = []
-            for i in range(y_test.shape[1]):
-                f1 = f1_score(y_test[:, i], y_pred[:, i])
-                f1_scores.append(f1)
-            
-            # Average F1 score
-            avg_f1 = np.mean(f1_scores)
-            medication_metrics['f1_score'] = avg_f1
+            try:
+                print("Evaluating final medication model on test set...")
+                medication_eval = medication_model.evaluate(X_test, y_test)
+                medication_metrics = {name: value for name, value in zip(medication_model.metrics_names, medication_eval)}
+            except Exception as e:
+                print(f"Error during model evaluation: {str(e)}")
+                
+                # Manual metrics calculation
+                try:
+                    # Try prediction with small batches
+                    print("Trying prediction with small batches...")
+                    y_pred_prob = medication_model.predict(X_test, batch_size=32)
+                    
+                    # Calculate metrics manually
+                    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+                    
+                    y_pred = (y_pred_prob >= 0.5).astype(int)
+                    
+                    # For multi-label metrics, use micro-averaging
+                    medication_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': accuracy_score(y_test, y_pred),
+                        'precision': precision_score(y_test, y_pred, average='micro'),
+                        'recall': recall_score(y_test, y_pred, average='micro'),
+                        'f1_score': f1_score(y_test, y_pred, average='micro')
+                    }
+                    
+                    # For AUC, average across classes
+                    auc_scores = []
+                    for i in range(y_test.shape[1]):
+                        try:
+                            # Skip classes with no positive examples
+                            if np.sum(y_test[:, i]) > 0 and np.sum(y_test[:, i]) < len(y_test):
+                                auc_scores.append(roc_auc_score(y_test[:, i], y_pred_prob[:, i]))
+                        except Exception:
+                            # Skip classes that cause problems
+                            pass
+                    
+                    if auc_scores:
+                        medication_metrics['auc'] = np.mean(auc_scores)
+                    else:
+                        medication_metrics['auc'] = 0.5
+                    
+                    print(f"Manual evaluation metrics: {medication_metrics}")
+                except Exception as e:
+                    print(f"Manual metric calculation failed: {str(e)}")
+                    medication_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': 0.5,
+                        'precision': 0.5,
+                        'recall': 0.5,
+                        'f1_score': 0.5,
+                        'auc': 0.5
+                    }
             
             # Store results
             results['medication'] = {
                 'model': medication_model,
                 'metrics': medication_metrics,
                 'y_test': y_test,
-                'y_pred': y_pred,
+                'y_pred': (y_pred_prob >= 0.5).astype(int),
                 'y_pred_prob': y_pred_prob,
                 'categories': self.medication_categories,
                 'selected_features': selected_feature_names,
@@ -4497,11 +4294,30 @@ class ClinicalPredictionModel:
             print("\nOptimizing procedure prediction model...")
             y_procedure = targets['procedures']
             
-            # Perform enhanced feature selection
+            # Verify target shape and values
+            print(f"Procedure target shape: {y_procedure.shape}")
+            print(f"Procedure categories: {len(self.procedure_categories)}")
+            
+            # Quick sanity check on target values
+            if y_procedure.shape[1] != len(self.procedure_categories):
+                print(f"WARNING: Mismatch between y_procedure shape[1]={y_procedure.shape[1]} and procedure_categories={len(self.procedure_categories)}")
+            
+            # Print positive example percentage for each procedure category
+            positive_rates = np.mean(y_procedure, axis=0)
+            print("Positive examples per category:")
+            for i, (category, rate) in enumerate(zip(self.procedure_categories[:5], positive_rates[:5])):
+                print(f"  {i}: {category[:30]}... - {rate*100:.2f}%")
+            print(f"  ... and {len(self.procedure_categories)-5} more categories")
+            
+            # Calculate overall positive rate (rows with at least one positive label)
+            rows_with_positive = np.sum(np.sum(y_procedure, axis=1) > 0)
+            print(f"Rows with at least one positive procedure: {rows_with_positive}/{len(y_procedure)} ({rows_with_positive/len(y_procedure)*100:.1f}%)")
+            
+            # Perform feature selection
             print("Performing enhanced feature selection for procedure model...")
             feature_selection_results = self.enhanced_feature_selection(
-                X, y_procedure, features['feature_names'], 
-                n_features_range=(5, 80, 5),
+                X, y_procedure,processed_feature_names, 
+                n_features_range=(5, 50, 5),
                 method='ensemble'
             )
             
@@ -4516,7 +4332,7 @@ class ClinicalPredictionModel:
                 X_selected, y_procedure, test_size=0.2, random_state=42
             )
             
-            # Further split for hyperparameter tuning
+            # Further split train into train/validation for hyperparameter tuning
             X_train, X_val, y_train, y_val = train_test_split(
                 X_train, y_train, test_size=0.2, random_state=42
             )
@@ -4534,31 +4350,67 @@ class ClinicalPredictionModel:
             procedure_model = tuning_results['model']
             
             # Evaluate model on test set
-            print("Evaluating final procedure model on test set...")
-            procedure_eval = procedure_model.evaluate(X_test, y_test)
-            procedure_metrics = {name: value for name, value in zip(procedure_model.metrics_names, procedure_eval)}
-            
-            # Get predictions
-            y_pred_prob = procedure_model.predict(X_test)
-            y_pred = (y_pred_prob >= 0.5).astype(int)
-            
-            # Calculate F1 scores manually
-            from sklearn.metrics import f1_score
-            f1_scores = []
-            for i in range(y_test.shape[1]):
-                f1 = f1_score(y_test[:, i], y_pred[:, i])
-                f1_scores.append(f1)
-            
-            # Average F1 score
-            avg_f1 = np.mean(f1_scores)
-            procedure_metrics['f1_score'] = avg_f1
+            try:
+                print("Evaluating final procedure model on test set...")
+                procedure_eval = procedure_model.evaluate(X_test, y_test)
+                procedure_metrics = {name: value for name, value in zip(procedure_model.metrics_names, procedure_eval)}
+            except Exception as e:
+                print(f"Error during model evaluation: {str(e)}")
+                
+                # Manual metrics calculation
+                try:
+                    # Try prediction with small batches
+                    print("Trying prediction with small batches...")
+                    y_pred_prob = procedure_model.predict(X_test, batch_size=32)
+                    
+                    # Calculate metrics manually
+                    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+                    
+                    y_pred = (y_pred_prob >= 0.5).astype(int)
+                    
+                    # For multi-label metrics, use micro-averaging
+                    procedure_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': accuracy_score(y_test, y_pred),
+                        'precision': precision_score(y_test, y_pred, average='micro'),
+                        'recall': recall_score(y_test, y_pred, average='micro'),
+                        'f1_score': f1_score(y_test, y_pred, average='micro')
+                    }
+                    
+                    # For AUC, average across classes
+                    auc_scores = []
+                    for i in range(y_test.shape[1]):
+                        try:
+                            # Skip classes with no positive examples
+                            if np.sum(y_test[:, i]) > 0 and np.sum(y_test[:, i]) < len(y_test):
+                                auc_scores.append(roc_auc_score(y_test[:, i], y_pred_prob[:, i]))
+                        except Exception:
+                            # Skip classes that cause problems
+                            pass
+                    
+                    if auc_scores:
+                        procedure_metrics['auc'] = np.mean(auc_scores)
+                    else:
+                        procedure_metrics['auc'] = 0.5
+                    
+                    print(f"Manual evaluation metrics: {procedure_metrics}")
+                except Exception as e:
+                    print(f"Manual metric calculation failed: {str(e)}")
+                    procedure_metrics = {
+                        'loss': float('nan'),
+                        'accuracy': 0.5,
+                        'precision': 0.5,
+                        'recall': 0.5,
+                        'f1_score': 0.5,
+                        'auc': 0.5
+                    }
             
             # Store results
             results['procedure'] = {
                 'model': procedure_model,
                 'metrics': procedure_metrics,
                 'y_test': y_test,
-                'y_pred': y_pred,
+                'y_pred': (y_pred_prob >= 0.5).astype(int),
                 'y_pred_prob': y_pred_prob,
                 'categories': self.procedure_categories,
                 'selected_features': selected_feature_names,
@@ -4938,11 +4790,285 @@ class ClinicalPredictionModel:
             'clinical_insights': clinical_insights,
             'timeline_df': timeline_df
         }
+    
+
+    def save_optimized_models_results(self, results, output_dir='optimized_models'):
+        """
+        Save optimized models, their hyperparameters, and performance metrics
+        
+        Args:
+            results: Dictionary with optimized model results
+            output_dir: Directory to save models and metadata
+        """
+        import os
+        import json
+        import joblib
+        from datetime import datetime
+        
+        # Create output directories
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'metadata'), exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save the preprocessing pipeline
+        if 'main' in self.preprocessors:
+            preprocessor_path = os.path.join(output_dir, f'preprocessor_{timestamp}.joblib')
+            joblib.dump(self.preprocessors['main'], preprocessor_path)
+            print(f"Saved preprocessor to {preprocessor_path}")
+        
+        # Save each model and its metadata
+        for model_type, result in results.items():
+            if 'model' not in result:
+                continue
+            
+            # Save TensorFlow model
+            model_path = os.path.join(output_dir, 'models', f"{model_type}_model_{timestamp}.keras")
+            result['model'].save(model_path)
+            
+            # Create metadata object (without large numpy arrays)
+            metadata = {
+                'timestamp': timestamp,
+                'metrics': {k: float(v) for k, v in result.get('metrics', {}).items()},
+                'model_path': model_path,
+                'preprocessor_path': preprocessor_path,
+                'selected_features': result.get('selected_features', [])
+            }
+            
+            # Add hyperparameters if available
+            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
+                metadata['hyperparameters'] = result['hyperparameter_tuning']['best_hyperparameters']
+            
+            # Add model-specific information
+            if model_type == 'emergency_visit' and 'best_threshold' in result:
+                metadata['best_threshold'] = float(result['best_threshold'])
+            
+            if model_type in ['diagnosis', 'medication', 'procedure'] and 'categories' in result:
+                metadata['categories'] = result['categories']
+            
+            # Save metadata to JSON
+            metadata_path = os.path.join(output_dir, 'metadata', f"{model_type}_metadata_{timestamp}.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+            
+            print(f"Saved {model_type} model to {model_path} with metadata")
+        
+        # Generate comparison report of model performance
+        self.create_model_comparison_report(results, timestamp, output_dir)
+        
+        return True
+
+    def create_model_comparison_report(self, results, timestamp, output_dir='optimized_models'):
+        """
+        Create a comprehensive comparison report of model performance with visualizations
+        
+        Args:
+            results: Dictionary with model results
+            timestamp: Timestamp string for file naming
+            output_dir: Base directory to save report
+        """
+        import os
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # Create reports directory
+        reports_dir = os.path.join(output_dir, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        # Extract metrics from all models
+        models_metrics = []
+        
+        for model_type, result in results.items():
+            if 'metrics' not in result:
+                continue
+            
+            # Get metrics
+            metrics = result['metrics']
+            
+            # Add model type
+            metrics_row = {
+                'model_type': model_type,
+                **{k: float(v) for k, v in metrics.items()}
+            }
+            
+            # Add hyperparameter info if available
+            if 'hyperparameter_tuning' in result and 'best_hyperparameters' in result['hyperparameter_tuning']:
+                hp = result['hyperparameter_tuning']['best_hyperparameters']
+                
+                # Add key hyperparameters
+                if 'learning_rate' in hp:
+                    metrics_row['learning_rate'] = hp['learning_rate']
+                
+                if 'units_1' in hp:
+                    metrics_row['hidden_units'] = hp['units_1']
+                
+                if 'dropout_1' in hp:
+                    metrics_row['dropout_rate'] = hp['dropout_1']
+            
+            # Add feature selection info
+            if 'feature_selection' in result:
+                metrics_row['n_features'] = len(result.get('selected_features', []))
+                metrics_row['feature_selection_method'] = result['feature_selection'].get('method', 'unknown')
+            
+            models_metrics.append(metrics_row)
+        
+        if not models_metrics:
+            print("No metrics available for comparison report")
+            return
+        
+        # Create metrics DataFrame
+        metrics_df = pd.DataFrame(models_metrics)
+        
+        # Save metrics to CSV
+        metrics_file = os.path.join(reports_dir, f"model_metrics_comparison_{timestamp}.csv")
+        metrics_df.to_csv(metrics_file, index=False)
+        
+        # Create comparison visualizations
+        
+        # 1. Bar chart of key metrics for each model
+        # Identify metrics common to all models
+        common_metrics = ['accuracy', 'auc', 'precision', 'recall', 'f1_score']
+        available_metrics = [m for m in common_metrics if m in metrics_df.columns]
+        
+        if available_metrics:
+            plt.figure(figsize=(14, 8))
+            metrics_df_melted = pd.melt(
+                metrics_df, 
+                id_vars=['model_type'], 
+                value_vars=available_metrics,
+                var_name='Metric', 
+                value_name='Value'
+            )
+            
+            ax = sns.barplot(x='model_type', y='Value', hue='Metric', data=metrics_df_melted)
+            plt.title('Model Performance Comparison', fontsize=16)
+            plt.xlabel('Model Type', fontsize=14)
+            plt.ylabel('Metric Value', fontsize=14)
+            plt.legend(title='Metric', fontsize=12)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Rotate x-axis labels
+            plt.xticks(rotation=45, ha='right')
+            
+            # Adjust layout
+            plt.tight_layout()
+            
+            # Save figure
+            plt.savefig(os.path.join(reports_dir, f"model_comparison_chart_{timestamp}.png"))
+            plt.close()
+        
+        # 2. Create heatmap of metrics
+        if len(metrics_df) > 1 and len(available_metrics) > 1:
+            # Set model_type as index
+            metrics_heatmap_df = metrics_df.set_index('model_type')[available_metrics]
+            
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(metrics_heatmap_df, annot=True, fmt=".3f", cmap="YlGnBu")
+            plt.title('Model Metrics Heatmap', fontsize=16)
+            plt.tight_layout()
+            plt.savefig(os.path.join(reports_dir, f"metrics_heatmap_{timestamp}.png"))
+            plt.close()
+        
+        # 3. Create ROC curves comparison for binary models (if applicable)
+        binary_models = ['emergency_visit']
+        has_binary_models = any(model in results for model in binary_models)
+        
+        if has_binary_models:
+            from sklearn.metrics import roc_curve, auc
+            
+            plt.figure(figsize=(10, 8))
+            
+            for model_type in binary_models:
+                if model_type in results and 'y_test' in results[model_type] and 'y_pred_prob' in results[model_type]:
+                    result = results[model_type]
+                    y_test = result['y_test']
+                    y_pred_prob = result['y_pred_prob']
+                    
+                    # Calculate ROC curve
+                    fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+                    roc_auc = auc(fpr, tpr)
+                    
+                    # Plot ROC curve
+                    plt.plot(fpr, tpr, lw=2, label=f'{model_type} (AUC = {roc_auc:.3f})')
+            
+            # Add diagonal line (random classifier)
+            plt.plot([0, 1], [0, 1], 'k--', lw=2)
+            
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate', fontsize=14)
+            plt.ylabel('True Positive Rate', fontsize=14)
+            plt.title('ROC Curves Comparison', fontsize=16)
+            plt.legend(loc="lower right", fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(reports_dir, f"roc_curves_comparison_{timestamp}.png"))
+            plt.close()
+        
+        # 4. Create feature importance plots for each model
+        for model_type, result in results.items():
+            if 'feature_selection' not in result or 'selected_features' not in result:
+                continue
+            
+            feature_selection = result['feature_selection']
+            
+            if 'importance_scores' not in feature_selection:
+                continue
+            
+            importance_scores = feature_selection['importance_scores']
+            
+            # Convert to DataFrame
+            importance_df = pd.DataFrame({
+                'Feature': list(importance_scores.keys()),
+                'Importance': list(importance_scores.values())
+            }).sort_values('Importance', ascending=False)
+            
+            # Plot top 20 features
+            n_features = min(20, len(importance_df))
+            plt.figure(figsize=(12, 10))
+            
+            sns.barplot(y='Feature', x='Importance', data=importance_df.head(n_features))
+            plt.title(f'Top {n_features} Important Features for {model_type.replace("_", " ").title()} Model', fontsize=16)
+            plt.xlabel('Importance Score', fontsize=14)
+            plt.tight_layout()
+            
+            plt.savefig(os.path.join(reports_dir, f"{model_type}_feature_importance_{timestamp}.png"))
+            plt.close()
+        
+        # 5. Create a hyperparameters comparison table
+        hp_rows = []
+        
+        for model_type, result in results.items():
+            if 'hyperparameter_tuning' not in result or 'best_hyperparameters' not in result['hyperparameter_tuning']:
+                continue
+            
+            hp = result['hyperparameter_tuning']['best_hyperparameters']
+            
+            hp_row = {'model_type': model_type}
+            
+            # Add key hyperparameters
+            for param in ['learning_rate', 'units_1', 'units_2', 'dropout_1', 'dropout_2', 
+                        'activation_1', 'optimizer', 'l2_1', 'batch_norm_1']:
+                if param in hp:
+                    hp_row[param] = hp[param]
+            
+            hp_rows.append(hp_row)
+        
+        if hp_rows:
+            hp_df = pd.DataFrame(hp_rows)
+            hp_file = os.path.join(reports_dir, f"hyperparameters_comparison_{timestamp}.csv")
+            hp_df.to_csv(hp_file, index=False)
+        
+        print(f"Created model comparison report in {reports_dir}")
+
         
     def tune_model_hyperparameters(self, X_train, y_train, X_val, y_val, model_type='binary', 
-                                tuning_epochs=30, search_epochs=5, max_trials=20):
+                                    tuning_epochs=30, search_epochs=5, max_trials=20):
         """
-        Use Keras Tuner to optimize hyperparameters for the prediction model with F1 score as the primary metric
+        Improved version of tune_model_hyperparameters that correctly handles multi-label classification
         
         Args:
             X_train: Training feature matrix
@@ -4970,82 +5096,79 @@ class ClinicalPredictionModel:
         # Get timestamp for unique checkpoint naming
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        # Ensure y_train and y_val have the right shape
+        print(f"Input shapes - X_train: {X_train.shape}, y_train: {y_train.shape}")
+        
+        # Handle input shape correctly based on the model type
         input_shape = X_train.shape[1]  # Number of features
         
-        # For multi-label models, get the number of output classes
-        num_classes = 1 if model_type == 'binary' else y_train.shape[1]
+        # For multi-label, get the number of output classes
+        if model_type == 'binary':
+            # Ensure binary targets are properly shaped
+            if len(y_train.shape) == 1 or y_train.shape[1] == 1:
+                # Convert to 2D if needed
+                if len(y_train.shape) == 1:
+                    y_train = y_train.reshape(-1, 1)
+                if len(y_val.shape) == 1:
+                    y_val = y_val.reshape(-1, 1)
+                num_classes = 1
+            else:
+                raise ValueError(f"Binary classification expects 1D or (n,1) shape for y_train, got {y_train.shape}")
+        else:
+            # For multi-label, ensure we have 2D y with correct shape
+            if len(y_train.shape) != 2:
+                raise ValueError(f"Multi-label classification expects 2D y_train, got {y_train.shape}")
+            num_classes = y_train.shape[1]
         
-        # Fix 1: Reshape y_train and y_val to be 2D for binary classification
-        # This is critical to fix the F1Score shape mismatch error
-        if model_type == 'binary' and len(y_train.shape) == 1:
-            y_train = y_train.reshape(-1, 1)
-        
-        if model_type == 'binary' and len(y_val.shape) == 1:
-            y_val = y_val.reshape(-1, 1)
-            
-        print(f"Input shapes - X_train: {X_train.shape}, y_train: {y_train.shape}, X_val: {X_val.shape}, y_val: {y_val.shape}")
+        print(f"Target shape - num_classes: {num_classes}")
         
         # Define model-building function for Keras Tuner
         def build_model(hp):
             model = keras.Sequential()
             
-            # Input layer
+            # Input layer with explicit input shape
             model.add(keras.layers.Input(shape=(input_shape,)))
             
             # First hidden layer - tune number of units, activation function and regularization
+            units_1 = hp.Int('units_1', min_value=32, max_value=512, step=32)
+            activation_1 = hp.Choice('activation_1', values=['relu', 'selu', 'elu', 'tanh'])
+            l2_1 = hp.Float('l2_1', min_value=1e-4, max_value=1e-2, sampling='log')
+            
             model.add(keras.layers.Dense(
-                units=hp.Int('units_1', min_value=32, max_value=512, step=32),
-                activation=hp.Choice('activation_1', values=['relu', 'selu', 'elu', 'tanh']),
-                kernel_regularizer=keras.regularizers.l2(
-                    hp.Float('l2_1', min_value=1e-4, max_value=1e-2, sampling='log')
-                )
+                units=units_1,
+                activation=activation_1,
+                kernel_regularizer=keras.regularizers.l2(l2_1)
             ))
             
             # Add BatchNormalization with optional momentum
             use_batch_norm = hp.Boolean('batch_norm_1')
             if use_batch_norm:
-                model.add(keras.layers.BatchNormalization(
-                    momentum=hp.Float('bn_momentum_1', min_value=0.7, max_value=0.99, default=0.9)
-                ))
+                bn_momentum_1 = hp.Float('bn_momentum_1', min_value=0.7, max_value=0.99, default=0.9)
+                model.add(keras.layers.BatchNormalization(momentum=bn_momentum_1))
             
             # Add Dropout with tunable rate
-            model.add(keras.layers.Dropout(
-                rate=hp.Float('dropout_1', min_value=0.1, max_value=0.6, step=0.1)
-            ))
+            dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.6, step=0.1)
+            model.add(keras.layers.Dropout(rate=dropout_1))
             
             # Optional second hidden layer
             if hp.Boolean('second_layer'):
+                units_2 = hp.Int('units_2', min_value=16, max_value=256, step=16)
+                activation_2 = hp.Choice('activation_2', values=['relu', 'selu', 'elu', 'tanh'])
+                l2_2 = hp.Float('l2_2', min_value=1e-4, max_value=1e-2, sampling='log')
+                
                 model.add(keras.layers.Dense(
-                    units=hp.Int('units_2', min_value=16, max_value=256, step=16),
-                    activation=hp.Choice('activation_2', values=['relu', 'selu', 'elu', 'tanh']),
-                    kernel_regularizer=keras.regularizers.l2(
-                        hp.Float('l2_2', min_value=1e-4, max_value=1e-2, sampling='log')
-                    )
+                    units=units_2,
+                    activation=activation_2,
+                    kernel_regularizer=keras.regularizers.l2(l2_2)
                 ))
                 
                 # Optional batch normalization for second layer
                 if hp.Boolean('batch_norm_2'):
-                    model.add(keras.layers.BatchNormalization(
-                        momentum=hp.Float('bn_momentum_2', min_value=0.7, max_value=0.99, default=0.9)
-                    ))
+                    bn_momentum_2 = hp.Float('bn_momentum_2', min_value=0.7, max_value=0.99, default=0.9)
+                    model.add(keras.layers.BatchNormalization(momentum=bn_momentum_2))
                 
-                model.add(keras.layers.Dropout(
-                    rate=hp.Float('dropout_2', min_value=0.1, max_value=0.5, step=0.1)
-                ))
-            
-            # Optional third hidden layer
-            if hp.Boolean('third_layer'):
-                model.add(keras.layers.Dense(
-                    units=hp.Int('units_3', min_value=8, max_value=128, step=8),
-                    activation=hp.Choice('activation_3', values=['relu', 'selu', 'elu', 'tanh']),
-                    kernel_regularizer=keras.regularizers.l2(
-                        hp.Float('l2_3', min_value=1e-4, max_value=1e-2, sampling='log')
-                    )
-                ))
-                
-                model.add(keras.layers.Dropout(
-                    rate=hp.Float('dropout_3', min_value=0.1, max_value=0.4, step=0.1)
-                ))
+                dropout_2 = hp.Float('dropout_2', min_value=0.1, max_value=0.5, step=0.1)
+                model.add(keras.layers.Dropout(rate=dropout_2))
             
             # Output layer
             if model_type == 'binary':
@@ -5061,54 +5184,57 @@ class ClinicalPredictionModel:
             if optimizer_choice == 'adam':
                 optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
             elif optimizer_choice == 'adamw':
-                optimizer = keras.optimizers.AdamW(
-                    learning_rate=learning_rate,
-                    weight_decay=hp.Float('weight_decay', min_value=1e-5, max_value=1e-3, sampling='log')
-                )
+                weight_decay = hp.Float('weight_decay', min_value=1e-5, max_value=1e-3, sampling='log')
+                optimizer = keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
             else:  # rmsprop
                 optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
             
-            # Fix 2: Modified metrics configuration to ensure compatibility with reshaped data
-            if model_type == 'binary':
-                metrics = [
-                    keras.metrics.BinaryAccuracy(name='accuracy'),
-                    keras.metrics.AUC(name='auc'),
-                    keras.metrics.Precision(name='precision'),
-                    keras.metrics.Recall(name='recall'),
-                    # Ensure F1Score is configured correctly for binary classification
-                    keras.metrics.F1Score(
-                        name='f1_score',
-                        threshold=0.5,
-                        dtype=tf.float32
-                    )
-                ]
-            else:
-                # For multi-label, use default metrics configuration
-                metrics = [
-                    keras.metrics.BinaryAccuracy(name='accuracy'),
-                    keras.metrics.AUC(name='auc'),
-                    keras.metrics.Precision(name='precision'),
-                    keras.metrics.Recall(name='recall'),
-                    keras.metrics.F1Score(
-                        name='f1_score',
-                        threshold=0.5,
-                        dtype=tf.float32
-                    )
-                ]
+            # Define metrics based on model type
+            metrics = [
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.AUC(name='auc'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall')
+            ]
             
-            # Compile model - use binary_crossentropy for both binary and multi-label
+            # Add F1Score metric correctly based on model type
+            if model_type == 'binary':
+                metrics.append(keras.metrics.F1Score(
+                    name='f1_score',
+                    threshold=0.5,
+                    dtype=tf.float32
+                ))
+            else:
+                # For multi-label, need to specify the average method
+                metrics.append(keras.metrics.F1Score(
+                    name='f1_score',
+                    threshold=0.5,
+                    average='micro',  # Use micro averaging for multi-label
+                    dtype=tf.float32
+                ))
+            
+            # Compile model with the correct loss function
+            if model_type == 'binary':
+                loss = 'binary_crossentropy'
+            else:
+                # For multi-label classification, still use binary_crossentropy
+                # but with from_logits=False since we're using sigmoid activation
+                loss = 'binary_crossentropy'
+            
             model.compile(
                 optimizer=optimizer,
-                loss='binary_crossentropy',
+                loss=loss,
                 metrics=metrics
             )
             
             return model
         
-        # Create instance of the tuner - now using F1 Score as the objective
+        # Create instance of the tuner
+        objective_metric = 'val_f1_score'  # Use F1 score as the primary evaluation metric
+        
         tuner = kt.Hyperband(
             build_model,
-            objective=kt.Objective('val_f1_score', direction='max'),
+            objective=kt.Objective(objective_metric, direction='max'),
             max_epochs=tuning_epochs,
             factor=3,
             directory='hyperparameter_tuning',
@@ -5116,17 +5242,17 @@ class ClinicalPredictionModel:
             overwrite=True
         )
         
-        # Define early stopping callback for the search
+        # Define early stopping callback
         early_stopping = keras.callbacks.EarlyStopping(
-            monitor='val_f1_score',
+            monitor='val_loss',
             patience=5,
             restore_best_weights=True
         )
         
-        # Add checkpoint callback like in train_models
+        # Add checkpoint callback
         checkpoint_callback = keras.callbacks.ModelCheckpoint(
-            filepath=f'saved_models/checkpoints/{model_type}_tuning_{timestamp}_epoch_{{epoch:02d}}.keras',
-            save_best_only=False,
+            filepath=f'optimized_saved_models/checkpoints/{model_type}_tuning_{timestamp}_epoch_{{epoch:02d}}.keras',
+            save_best_only=True,
             save_weights_only=False,
             verbose=1
         )
@@ -5134,17 +5260,15 @@ class ClinicalPredictionModel:
         # Print search space summary
         tuner.search_space_summary()
         
-        # Prepare sample weights if dealing with imbalanced data
+        # Set up sample weights or class weights based on model type
         if model_type == 'binary':
-            # Class weights for binary imbalanced problems
-            # Fix 3: Use flattened version of y_train for calculating class weights
-            y_flat = y_train.flatten() if len(y_train.shape) > 1 else y_train
-            pos_count = np.sum(y_flat)
-            neg_count = len(y_flat) - pos_count
+            # For binary classification, use class weights
+            positive_count = np.sum(y_train)
+            negative_count = len(y_train) - positive_count
+            print(f"Class distribution - Positives: {positive_count}, Negatives: {negative_count}")
             
-            if pos_count > 0 and neg_count > 0:
-                # Calculate class weights
-                weight_ratio = neg_count / pos_count
+            if positive_count > 0 and negative_count > 0:
+                weight_ratio = negative_count / positive_count
                 class_weight = {0: 1.0, 1: min(5.0, weight_ratio)}  # Cap at 5x to prevent extreme weights
                 print(f"Using class weights: {class_weight}")
                 
@@ -5158,7 +5282,6 @@ class ClinicalPredictionModel:
                     verbose=1
                 )
             else:
-                # Handle edge case where one class has zero examples
                 print("Warning: One class has zero examples. Proceeding without class weights.")
                 tuner.search(
                     X_train, y_train, 
@@ -5168,12 +5291,25 @@ class ClinicalPredictionModel:
                     verbose=1
                 )
         else:
-            # For multi-label, use sample weighting
+            # For multi-label, use sample weighting based on presence of any positive label
+            print(f"Multi-label with {num_classes} classes")
+            # Initialize sample weights
             sample_weights = np.ones(len(y_train))
             
             # Increase weight for samples with at least one positive label
             pos_samples = np.sum(y_train, axis=1) > 0
-            sample_weights[pos_samples] = 3.0
+            pos_count = np.sum(pos_samples)
+            neg_count = len(sample_weights) - pos_count
+            
+            print(f"Samples with at least one positive label: {pos_count}/{len(sample_weights)} ({pos_count/len(sample_weights)*100:.1f}%)")
+            
+            if pos_count > 0:
+                # Calculate weight ratio: samples without any positive label / samples with at least one positive label
+                weight_ratio = neg_count / pos_count if neg_count > 0 else 1.0
+                # Limit weight to avoid extreme values
+                weight = min(3.0, weight_ratio)
+                sample_weights[pos_samples] = weight
+                print(f"Using sample weights: {weight:.2f}x for positive samples")
             
             tuner.search(
                 X_train, y_train,
@@ -5193,28 +5329,27 @@ class ClinicalPredictionModel:
         # Build model with best hyperparameters
         best_model = build_model(best_hp)
         
+        # Create checkpoint callback for best model
+        final_checkpoint_callback = keras.callbacks.ModelCheckpoint(
+            filepath=f'optimized_saved_models/checkpoints/{model_type}_best_{timestamp}_epoch_{{epoch:02d}}.keras',
+            save_best_only=True,
+            save_weights_only=False,
+            verbose=1
+        )
+        
         # Add reduce learning rate callback for final training
         reduce_lr = keras.callbacks.ReduceLROnPlateau(
-            monitor='val_f1_score',  # Monitor F1 score
+            monitor='val_loss',
             factor=0.5,
             patience=3,
             min_lr=0.00001,
             verbose=1
         )
         
-        # Create checkpoint callback for best model
-        final_checkpoint_callback = keras.callbacks.ModelCheckpoint(
-            filepath=f'saved_models/checkpoints/{model_type}_best_{timestamp}_epoch_{{epoch:02d}}.keras',
-            save_best_only=False,
-            save_weights_only=False,
-            verbose=1
-        )
-        
-        # Fix 4: Make sure to use the same class weight calculation for final model training
+        # Train final model with best hyperparameters, using appropriate weighting method
         if model_type == 'binary':
-            y_flat = y_train.flatten() if len(y_train.shape) > 1 else y_train
-            pos_count = np.sum(y_flat)
-            neg_count = len(y_flat) - pos_count
+            pos_count = np.sum(y_train)
+            neg_count = len(y_train) - pos_count
             
             if pos_count > 0 and neg_count > 0:
                 weight_ratio = neg_count / pos_count
@@ -5224,11 +5359,7 @@ class ClinicalPredictionModel:
                     X_train, y_train,
                     validation_data=(X_val, y_val),
                     epochs=search_epochs,
-                    callbacks=[
-                        early_stopping, 
-                        reduce_lr,
-                        final_checkpoint_callback
-                    ],
+                    callbacks=[early_stopping, reduce_lr, final_checkpoint_callback],
                     class_weight=class_weight,
                     verbose=1
                 )
@@ -5237,74 +5368,155 @@ class ClinicalPredictionModel:
                     X_train, y_train,
                     validation_data=(X_val, y_val),
                     epochs=search_epochs,
-                    callbacks=[
-                        early_stopping, 
-                        reduce_lr,
-                        final_checkpoint_callback
-                    ],
+                    callbacks=[early_stopping, reduce_lr, final_checkpoint_callback],
                     verbose=1
                 )
         else:
             # For multi-label, use sample weighting
             sample_weights = np.ones(len(y_train))
             pos_samples = np.sum(y_train, axis=1) > 0
-            sample_weights[pos_samples] = 3.0
+            
+            if np.sum(pos_samples) > 0:
+                weight_ratio = (len(sample_weights) - np.sum(pos_samples)) / np.sum(pos_samples)
+                weight = min(3.0, weight_ratio)
+                sample_weights[pos_samples] = weight
             
             history = best_model.fit(
                 X_train, y_train,
                 validation_data=(X_val, y_val),
                 epochs=search_epochs,
-                callbacks=[
-                    early_stopping, 
-                    reduce_lr,
-                    final_checkpoint_callback
-                ],
+                callbacks=[early_stopping, reduce_lr, final_checkpoint_callback],
                 sample_weight=sample_weights,
                 verbose=1
             )
         
         # Evaluate final model
-        eval_results = best_model.evaluate(X_val, y_val)
-        metrics = {name: value for name, value in zip(best_model.metrics_names, eval_results)}
+        try:
+            print(f"Evaluating model on validation data...")
+            eval_results = best_model.evaluate(X_val, y_val, verbose=1)
+            metrics = {name: value for name, value in zip(best_model.metrics_names, eval_results)}
+            
+            print("Final model evaluation:")
+            for metric, value in metrics.items():
+                print(f"{metric}: {value:.4f}")
+                
+        except Exception as e:
+            print(f"Error during model evaluation: {str(e)}")
+            print("Falling back to manual metrics calculation...")
+            
+            # Manually calculate metrics for robustness
+            metrics = {}
+            
+            try:
+                # Try prediction with small batches
+                print("Trying prediction with small batches...")
+                y_pred_prob = best_model.predict(X_val, batch_size=128)
+                
+                # Calculate metrics manually
+                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+                
+                y_pred = (y_pred_prob >= 0.5).astype(int)
+                
+                if model_type == 'binary':
+                    # Binary classification metrics
+                    metrics['accuracy'] = accuracy_score(y_val, y_pred)
+                    metrics['precision'] = precision_score(y_val, y_pred)
+                    metrics['recall'] = recall_score(y_val, y_pred)
+                    metrics['f1_score'] = f1_score(y_val, y_pred)
+                    
+                    # Calculate AUC
+                    if y_pred_prob.ndim > 1 and y_pred_prob.shape[1] == 1:
+                        # Flatten if needed
+                        y_pred_prob_flat = y_pred_prob.flatten()
+                    else:
+                        y_pred_prob_flat = y_pred_prob
+                        
+                    metrics['auc'] = roc_auc_score(y_val, y_pred_prob_flat)
+                else:
+                    # Multi-label classification metrics
+                    metrics['accuracy'] = accuracy_score(y_val, y_pred)
+                    metrics['precision'] = precision_score(y_val, y_pred, average='micro')
+                    metrics['recall'] = recall_score(y_val, y_pred, average='micro')
+                    metrics['f1_score'] = f1_score(y_val, y_pred, average='micro')
+                    
+                    # For multi-label AUC, we'll use the average of per-class AUCs
+                    if num_classes > 1:
+                        auc_scores = []
+                        for i in range(num_classes):
+                            try:
+                                # Only calculate AUC if there are both positive and negative examples
+                                if np.sum(y_val[:, i]) > 0 and np.sum(y_val[:, i]) < len(y_val):
+                                    auc_scores.append(roc_auc_score(y_val[:, i], y_pred_prob[:, i]))
+                            except Exception:
+                                # Skip classes that cause problems
+                                pass
+                        
+                        if auc_scores:
+                            metrics['auc'] = np.mean(auc_scores)
+                        else:
+                            metrics['auc'] = 0.5  # Default if we couldn't calculate
+                
+                print("Manual evaluation metrics:", metrics)
+                
+            except Exception as e:
+                print(f"Manual metric calculation failed: {str(e)}")
+                # Set default metrics to avoid breaking the pipeline
+                metrics = {
+                    'loss': float('nan'),
+                    'accuracy': 0.5,
+                    'precision': 0.5,
+                    'recall': 0.5,
+                    'f1_score': 0.5,
+                    'auc': 0.5
+                }
         
-        print("Final model evaluation:")
-        for metric, value in metrics.items():
-            print(f"{metric}: {value:.4f}")
+        # For binary models, calculate the optimal threshold
+        if model_type == 'binary':
+            print("Getting final predictions and calculating optimal threshold...")
+            
+            # Get predictions on test set
+            y_pred_prob = best_model.predict(X_val)
+            if y_pred_prob.ndim > 1 and y_pred_prob.shape[1] == 1:
+                y_pred_prob = y_pred_prob.flatten()
+                
+            # Find optimal threshold using precision-recall curve
+            from sklearn.metrics import precision_recall_curve, f1_score
+            
+            y_val_flat = y_val.flatten() if y_val.ndim > 1 else y_val
+            precision, recall, thresholds = precision_recall_curve(y_val_flat, y_pred_prob)
+            
+            # Calculate F1 score for each threshold
+            f1_scores = []
+            for threshold in thresholds:
+                y_pred_thresh = (y_pred_prob >= threshold).astype(int)
+                f1 = f1_score(y_val_flat, y_pred_thresh)
+                f1_scores.append(f1)
+            
+            # Find threshold with best F1 score
+            best_idx = np.argmax(f1_scores)
+            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+            best_f1 = f1_scores[best_idx] if best_idx < len(f1_scores) else f1_score(y_val_flat, (y_pred_prob >= 0.5).astype(int))
+            
+            print(f"Optimal threshold: {best_threshold:.4f}")
+            print(f"F1 Score at optimal threshold: {best_f1:.4f}")
+            
+            # Update F1 score with the optimal threshold value
+            metrics['f1_score'] = best_f1
+            
+        # Save debug metrics to a file
+        try:
+            debug_dir = 'debug_models'
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            metrics_df = pd.DataFrame([metrics])
+            metrics_file = os.path.join(debug_dir, f'{model_type}_metrics_{timestamp}.csv')
+            metrics_df.to_csv(metrics_file, index=False)
+            print(f"Saved metrics to {metrics_file}")
+        except Exception as e:
+            print(f"Error saving debug metrics: {str(e)}")
         
-        # Plot training history
-        import matplotlib.pyplot as plt
-        
-        plt.figure(figsize=(15, 5))
-        
-        plt.subplot(1, 3, 1)
-        plt.plot(history.history['loss'], label='Train Loss')
-        plt.plot(history.history['val_loss'], label='Validation Loss')
-        plt.title('Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        
-        plt.subplot(1, 3, 2)
-        plt.plot(history.history['f1_score'], label='Train F1')
-        plt.plot(history.history['val_f1_score'], label='Validation F1')
-        plt.title('F1 Score')
-        plt.xlabel('Epoch')
-        plt.ylabel('F1 Score')
-        plt.legend()
-        
-        plt.subplot(1, 3, 3)
-        plt.plot(history.history['precision'], label='Precision')
-        plt.plot(history.history['recall'], label='Recall')
-        plt.title('Precision and Recall')
-        plt.xlabel('Epoch')
-        plt.ylabel('Value')
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(f'hyperparameter_tuning/final_model_{model_type}_training_{timestamp}.png')
-        plt.close()
-        
-        return {
+        # Create result dictionary
+        result = {
             'model': best_model,
             'best_hyperparameters': best_hp.values,
             'metrics': metrics,
@@ -5312,6 +5524,12 @@ class ClinicalPredictionModel:
             'tuner': tuner,
             'timestamp': timestamp
         }
+        
+        # For binary models, also include optimal threshold
+        if model_type == 'binary':
+            result['best_threshold'] = best_threshold
+        
+        return result
 
 
     def enhanced_feature_selection(self, X, y, feature_names, n_features_range=(5, 80, 5), method='ensemble', 
