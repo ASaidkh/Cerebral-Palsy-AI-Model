@@ -3779,7 +3779,7 @@ class ClinicalPredictionModel:
         
         # Store results
         results = {}
-        
+        '''
         # ----------------- EMERGENCY VISIT MODEL -----------------
         if 'emergency_visit' in targets and len(targets['emergency_visit']) > 0:
             print("\nOptimizing emergency visit prediction model...")
@@ -3987,7 +3987,7 @@ class ClinicalPredictionModel:
             }
             
             print(f"Emergency visit model optimized with metrics: {emergency_metrics}")
-            
+            '''
         # ----------------- DIAGNOSIS MODEL -----------------
         if 'diagnoses' in targets and len(targets['diagnoses']) > 0 and len(self.diagnosis_categories) > 0:
             print("\nOptimizing diagnosis prediction model...")
@@ -5068,7 +5068,7 @@ class ClinicalPredictionModel:
     def tune_model_hyperparameters(self, X_train, y_train, X_val, y_val, model_type='binary', 
                                     tuning_epochs=30, search_epochs=5, max_trials=20):
         """
-        Improved version of tune_model_hyperparameters that correctly handles multi-label classification
+        Improved hyperparameter tuning that correctly handles multi-label classification
         
         Args:
             X_train: Training feature matrix
@@ -5089,6 +5089,8 @@ class ClinicalPredictionModel:
         import tensorflow as tf
         import keras_tuner as kt
         from datetime import datetime
+        import pandas as pd
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
         
         # Create directory for checkpoints
         os.makedirs('optimized_saved_models/checkpoints', exist_ok=True)
@@ -5130,9 +5132,9 @@ class ClinicalPredictionModel:
             model.add(keras.layers.Input(shape=(input_shape,)))
             
             # First hidden layer - tune number of units, activation function and regularization
-            units_1 = hp.Int('units_1', min_value=32, max_value=512, step=32)
-            activation_1 = hp.Choice('activation_1', values=['relu', 'selu', 'elu', 'tanh'])
-            l2_1 = hp.Float('l2_1', min_value=1e-4, max_value=1e-2, sampling='log')
+            units_1 = hp.Int('units_1', min_value=64, max_value=512, step=32)
+            activation_1 = hp.Choice('activation_1', values=['relu', 'selu', 'elu'])
+            l2_1 = hp.Float('l2_1', min_value=1e-5, max_value=1e-2, sampling='log')
             
             model.add(keras.layers.Dense(
                 units=units_1,
@@ -5147,14 +5149,14 @@ class ClinicalPredictionModel:
                 model.add(keras.layers.BatchNormalization(momentum=bn_momentum_1))
             
             # Add Dropout with tunable rate
-            dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.6, step=0.1)
+            dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.5, step=0.1)
             model.add(keras.layers.Dropout(rate=dropout_1))
             
             # Optional second hidden layer
             if hp.Boolean('second_layer'):
-                units_2 = hp.Int('units_2', min_value=16, max_value=256, step=16)
-                activation_2 = hp.Choice('activation_2', values=['relu', 'selu', 'elu', 'tanh'])
-                l2_2 = hp.Float('l2_2', min_value=1e-4, max_value=1e-2, sampling='log')
+                units_2 = hp.Int('units_2', min_value=32, max_value=256, step=32)
+                activation_2 = hp.Choice('activation_2', values=['relu', 'selu', 'elu'])
+                l2_2 = hp.Float('l2_2', min_value=1e-5, max_value=1e-2, sampling='log')
                 
                 model.add(keras.layers.Dense(
                     units=units_2,
@@ -5177,25 +5179,26 @@ class ClinicalPredictionModel:
                 model.add(keras.layers.Dense(num_classes, activation='sigmoid'))  # multi-label
             
             # Tune learning rate for optimizer
-            learning_rate = hp.Float('learning_rate', min_value=1e-4, max_value=1e-2, sampling='log')
+            learning_rate = hp.Float('learning_rate', min_value=5e-5, max_value=1e-3, sampling='log')
             
             # Choose optimizer
-            optimizer_choice = hp.Choice('optimizer', values=['adam', 'adamw', 'rmsprop'])
+            optimizer_choice = hp.Choice('optimizer', values=['adam', 'adamw'])
             if optimizer_choice == 'adam':
                 optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-            elif optimizer_choice == 'adamw':
-                weight_decay = hp.Float('weight_decay', min_value=1e-5, max_value=1e-3, sampling='log')
+            else:  # adamw
+                weight_decay = hp.Float('weight_decay', min_value=1e-6, max_value=1e-3, sampling='log')
                 optimizer = keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
-            else:  # rmsprop
-                optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
             
             # Define metrics based on model type
             metrics = [
                 keras.metrics.BinaryAccuracy(name='accuracy'),
-                keras.metrics.AUC(name='auc'),
                 keras.metrics.Precision(name='precision'),
                 keras.metrics.Recall(name='recall')
             ]
+            
+            # Add AUC metric
+            if model_type == 'binary':
+                metrics.append(keras.metrics.AUC(name='auc'))
             
             # Add F1Score metric correctly based on model type
             if model_type == 'binary':
@@ -5205,7 +5208,7 @@ class ClinicalPredictionModel:
                     dtype=tf.float32
                 ))
             else:
-                # For multi-label, need to specify the average method
+                # For multi-label, specify the average method
                 metrics.append(keras.metrics.F1Score(
                     name='f1_score',
                     threshold=0.5,
@@ -5217,8 +5220,8 @@ class ClinicalPredictionModel:
             if model_type == 'binary':
                 loss = 'binary_crossentropy'
             else:
-                # For multi-label classification, still use binary_crossentropy
-                # but with from_logits=False since we're using sigmoid activation
+                # For multi-label classification, use binary_crossentropy
+                # as each output is a binary classification
                 loss = 'binary_crossentropy'
             
             model.compile(
@@ -5230,6 +5233,7 @@ class ClinicalPredictionModel:
             return model
         
         # Create instance of the tuner
+        # For multi-label, use micro-F1 as primary objective
         objective_metric = 'val_f1_score'  # Use F1 score as the primary evaluation metric
         
         tuner = kt.Hyperband(
@@ -5260,7 +5264,7 @@ class ClinicalPredictionModel:
         # Print search space summary
         tuner.search_space_summary()
         
-        # Set up sample weights or class weights based on model type
+        # Determine appropriate weighting method based on model type
         if model_type == 'binary':
             # For binary classification, use class weights
             positive_count = np.sum(y_train)
@@ -5291,26 +5295,36 @@ class ClinicalPredictionModel:
                     verbose=1
                 )
         else:
-            # For multi-label, use sample weighting based on presence of any positive label
+            # For multi-label, use sample weighting based on label density
             print(f"Multi-label with {num_classes} classes")
-            # Initialize sample weights
+            
+            # Calculate sample weights based on the number of positive labels
+            # This gives higher weight to samples with more positive labels
+            # and also gives higher weight to samples with at least one positive label
+            label_counts = np.sum(y_train, axis=1)
             sample_weights = np.ones(len(y_train))
             
             # Increase weight for samples with at least one positive label
-            pos_samples = np.sum(y_train, axis=1) > 0
+            pos_samples = label_counts > 0
             pos_count = np.sum(pos_samples)
-            neg_count = len(sample_weights) - pos_count
-            
-            print(f"Samples with at least one positive label: {pos_count}/{len(sample_weights)} ({pos_count/len(sample_weights)*100:.1f}%)")
             
             if pos_count > 0:
-                # Calculate weight ratio: samples without any positive label / samples with at least one positive label
-                weight_ratio = neg_count / pos_count if neg_count > 0 else 1.0
-                # Limit weight to avoid extreme values
-                weight = min(3.0, weight_ratio)
-                sample_weights[pos_samples] = weight
-                print(f"Using sample weights: {weight:.2f}x for positive samples")
+                # Calculate base weight for positive samples
+                base_weight = (len(y_train) - pos_count) / pos_count if pos_count < len(y_train) else 1.0
+                # Cap the weight to avoid extreme values
+                base_weight = min(3.0, base_weight)
+                
+                # Apply weights - samples with more positive labels get higher weights
+                for i in range(len(sample_weights)):
+                    if label_counts[i] > 0:
+                        # More positive labels = higher weight, up to 2x the base weight
+                        # This encourages the model to learn from rare combinations
+                        sample_weights[i] = base_weight * (1 + min(1.0, label_counts[i] / num_classes))
+                
+                print(f"Using sample weights: baseline {base_weight:.2f}x for positive samples")
+                print(f"Sample weights range: {np.min(sample_weights):.2f} - {np.max(sample_weights):.2f}")
             
+            # Search with sample weights
             tuner.search(
                 X_train, y_train,
                 validation_data=(X_val, y_val),
@@ -5372,14 +5386,18 @@ class ClinicalPredictionModel:
                     verbose=1
                 )
         else:
-            # For multi-label, use sample weighting
+            # For multi-label, use the sample weights calculated earlier
+            label_counts = np.sum(y_train, axis=1)
             sample_weights = np.ones(len(y_train))
-            pos_samples = np.sum(y_train, axis=1) > 0
+            pos_samples = label_counts > 0
             
             if np.sum(pos_samples) > 0:
-                weight_ratio = (len(sample_weights) - np.sum(pos_samples)) / np.sum(pos_samples)
-                weight = min(3.0, weight_ratio)
-                sample_weights[pos_samples] = weight
+                base_weight = (len(y_train) - np.sum(pos_samples)) / np.sum(pos_samples)
+                base_weight = min(3.0, base_weight)
+                
+                for i in range(len(sample_weights)):
+                    if label_counts[i] > 0:
+                        sample_weights[i] = base_weight * (1 + min(1.0, label_counts[i] / num_classes))
             
             history = best_model.fit(
                 X_train, y_train,
@@ -5413,51 +5431,70 @@ class ClinicalPredictionModel:
                 y_pred_prob = best_model.predict(X_val, batch_size=128)
                 
                 # Calculate metrics manually
-                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-                
                 y_pred = (y_pred_prob >= 0.5).astype(int)
                 
                 if model_type == 'binary':
                     # Binary classification metrics
-                    metrics['accuracy'] = accuracy_score(y_val, y_pred)
-                    metrics['precision'] = precision_score(y_val, y_pred)
-                    metrics['recall'] = recall_score(y_val, y_pred)
-                    metrics['f1_score'] = f1_score(y_val, y_pred)
+                    # Flatten arrays if necessary
+                    y_val_flat = y_val.flatten() if y_val.ndim > 1 else y_val
+                    y_pred_flat = y_pred.flatten() if y_pred.ndim > 1 else y_pred
                     
-                    # Calculate AUC
+                    metrics['accuracy'] = accuracy_score(y_val_flat, y_pred_flat)
+                    metrics['precision'] = precision_score(y_val_flat, y_pred_flat)
+                    metrics['recall'] = recall_score(y_val_flat, y_pred_flat)
+                    metrics['f1_score'] = f1_score(y_val_flat, y_pred_flat)
+                    
+                    # Calculate AUC for binary case
                     if y_pred_prob.ndim > 1 and y_pred_prob.shape[1] == 1:
-                        # Flatten if needed
                         y_pred_prob_flat = y_pred_prob.flatten()
                     else:
                         y_pred_prob_flat = y_pred_prob
                         
-                    metrics['auc'] = roc_auc_score(y_val, y_pred_prob_flat)
+                    try:
+                        from sklearn.metrics import roc_auc_score
+                        metrics['auc'] = roc_auc_score(y_val_flat, y_pred_prob_flat)
+                    except Exception as auc_error:
+                        print(f"Warning: Could not calculate AUC: {auc_error}")
+                        metrics['auc'] = 0.5  # Default value
                 else:
                     # Multi-label classification metrics
                     metrics['accuracy'] = accuracy_score(y_val, y_pred)
+                    
+                    # Calculate F1 score with different averaging methods
+                    metrics['f1_score'] = f1_score(y_val, y_pred, average='micro')
+                    metrics['f1_score_macro'] = f1_score(y_val, y_pred, average='macro')
+                    metrics['f1_score_weighted'] = f1_score(y_val, y_pred, average='weighted')
+                    
+                    # Calculate precision and recall
                     metrics['precision'] = precision_score(y_val, y_pred, average='micro')
                     metrics['recall'] = recall_score(y_val, y_pred, average='micro')
-                    metrics['f1_score'] = f1_score(y_val, y_pred, average='micro')
                     
-                    # For multi-label AUC, we'll use the average of per-class AUCs
-                    if num_classes > 1:
+                    # Calculate AUC for each class and average
+                    try:
+                        from sklearn.metrics import roc_auc_score
+                        # For multi-label AUC, we'll calculate per-class AUC and average
                         auc_scores = []
+                        
                         for i in range(num_classes):
-                            try:
-                                # Only calculate AUC if there are both positive and negative examples
-                                if np.sum(y_val[:, i]) > 0 and np.sum(y_val[:, i]) < len(y_val):
+                            # Only calculate if there's enough positive and negative examples
+                            pos_count = np.sum(y_val[:, i])
+                            if pos_count > 0 and pos_count < len(y_val):
+                                try:
                                     auc_scores.append(roc_auc_score(y_val[:, i], y_pred_prob[:, i]))
-                            except Exception:
-                                # Skip classes that cause problems
-                                pass
+                                except Exception:
+                                    # Skip classes that cause issues
+                                    pass
                         
                         if auc_scores:
                             metrics['auc'] = np.mean(auc_scores)
                         else:
-                            metrics['auc'] = 0.5  # Default if we couldn't calculate
+                            metrics['auc'] = 0.5  # Default value
+                    except Exception as auc_error:
+                        print(f"Warning: Could not calculate AUC: {auc_error}")
+                        metrics['auc'] = 0.5  # Default value
                 
                 print("Manual evaluation metrics:", metrics)
-                
+                    
             except Exception as e:
                 print(f"Manual metric calculation failed: {str(e)}")
                 # Set default metrics to avoid breaking the pipeline
@@ -5474,35 +5511,44 @@ class ClinicalPredictionModel:
         if model_type == 'binary':
             print("Getting final predictions and calculating optimal threshold...")
             
-            # Get predictions on test set
+            # Get predictions on validation set
             y_pred_prob = best_model.predict(X_val)
-            if y_pred_prob.ndim > 1 and y_pred_prob.shape[1] == 1:
-                y_pred_prob = y_pred_prob.flatten()
+            
+            # Flatten arrays if necessary
+            y_val_flat = y_val.flatten() if y_val.ndim > 1 else y_val
+            y_pred_prob_flat = y_pred_prob.flatten() if y_pred_prob.ndim > 1 else y_pred_prob
                 
             # Find optimal threshold using precision-recall curve
             from sklearn.metrics import precision_recall_curve, f1_score
             
-            y_val_flat = y_val.flatten() if y_val.ndim > 1 else y_val
-            precision, recall, thresholds = precision_recall_curve(y_val_flat, y_pred_prob)
-            
-            # Calculate F1 score for each threshold
-            f1_scores = []
-            for threshold in thresholds:
-                y_pred_thresh = (y_pred_prob >= threshold).astype(int)
-                f1 = f1_score(y_val_flat, y_pred_thresh)
-                f1_scores.append(f1)
-            
-            # Find threshold with best F1 score
-            best_idx = np.argmax(f1_scores)
-            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-            best_f1 = f1_scores[best_idx] if best_idx < len(f1_scores) else f1_score(y_val_flat, (y_pred_prob >= 0.5).astype(int))
-            
-            print(f"Optimal threshold: {best_threshold:.4f}")
-            print(f"F1 Score at optimal threshold: {best_f1:.4f}")
-            
-            # Update F1 score with the optimal threshold value
-            metrics['f1_score'] = best_f1
-            
+            try:
+                precision, recall, thresholds = precision_recall_curve(y_val_flat, y_pred_prob_flat)
+                
+                # Calculate F1 score for each threshold
+                f1_scores = []
+                for threshold in thresholds:
+                    y_pred_thresh = (y_pred_prob_flat >= threshold).astype(int)
+                    f1 = f1_score(y_val_flat, y_pred_thresh)
+                    f1_scores.append(f1)
+                
+                # Find threshold with best F1 score
+                best_idx = np.argmax(f1_scores)
+                best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+                best_f1 = f1_scores[best_idx] if best_idx < len(f1_scores) else f1_score(y_val_flat, (y_pred_prob_flat >= 0.5).astype(int))
+                
+                print(f"Optimal threshold: {best_threshold:.4f}")
+                print(f"F1 Score at optimal threshold: {best_f1:.4f}")
+                
+                # Update F1 score with the optimal threshold value
+                metrics['f1_score'] = best_f1
+            except Exception as e:
+                print(f"Could not calculate optimal threshold: {e}")
+                best_threshold = 0.5
+                
+        else:
+            # For multi-label, we'll use the standard threshold of 0.5
+            best_threshold = 0.5
+        
         # Save debug metrics to a file
         try:
             debug_dir = 'debug_models'
@@ -5532,14 +5578,14 @@ class ClinicalPredictionModel:
         return result
 
 
-    def enhanced_feature_selection(self, X, y, feature_names, n_features_range=(5, 80, 5), method='ensemble', 
+    def enhanced_feature_selection(self, X, y, feature_names, n_features_range=(5, 50, 5), method='ensemble', 
                             n_folds=5, plot_results=True, eval_method='cv'):
         """
         Perform enhanced feature selection using multiple advanced methods and find optimal feature count
         
         Args:
             X: Input features
-            y: Target values
+            y: Target values (can be multi-label)
             feature_names: List of feature names
             n_features_range: Tuple of (min_features, max_features, step) or list of feature counts to evaluate
             method: Selection method ('ensemble', 'rfe', 'boruta', 'shap', 'mutual_info')
@@ -5559,6 +5605,7 @@ class ClinicalPredictionModel:
         from sklearn.feature_selection import mutual_info_classif, f_classif
         from sklearn.model_selection import cross_val_score, StratifiedKFold
         from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
+        from sklearn.multioutput import MultiOutputClassifier
 
         print(f"Performing enhanced feature selection using {method} method with feature count optimization...")
         
@@ -5576,14 +5623,21 @@ class ClinicalPredictionModel:
                 # Add generic names if there are too few
                 additional_names = [f"feature_{i}" for i in range(len(feature_names), X.shape[1])]
                 feature_names = list(feature_names) + additional_names
+
+        # Determine if dealing with multi-label or binary target
+        is_multilabel = len(y.shape) > 1 and y.shape[1] > 1
         
-        # For multi-label targets, create a binary target for feature selection
-        if len(y.shape) > 1 and y.shape[1] > 1:
-            # Create a binary target based on whether any positive class exists
-            target = np.any(y == 1, axis=1).astype(int)
+        # Prepare target for feature selection
+        if is_multilabel:
+            # For multi-label, we'll use a different approach
+            # Create a flattened target for each class presence and combine their importances
+            print(f"Multi-label target detected with {y.shape[1]} classes")
+            # We'll use the presence of any positive class as a backup target for methods that 
+            # don't handle multi-label well
+            binary_target = np.any(y == 1, axis=1).astype(int)
         else:
-            # If already 1D, ensure it's flattened
-            target = y.flatten() if len(y.shape) > 1 else y
+            # For binary target, ensure it's flattened
+            binary_target = y.flatten() if len(y.shape) > 1 else y
         
         # Parse n_features_range parameter
         if isinstance(n_features_range, tuple) and len(n_features_range) == 3:
@@ -5629,94 +5683,165 @@ class ClinicalPredictionModel:
                 'lasso': None
             }
             
-            # 1. Random Forest importance
-            rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
-            rf.fit(X, target)
-            importance_methods['random_forest'] = rf.feature_importances_
-            features_df['RF_Importance'] = rf.feature_importances_
-            
-            # 2. Gradient Boosting importance
-            try:
-                gb = GradientBoostingClassifier(n_estimators=100, random_state=42)
-                gb.fit(X, target)
-                importance_methods['gradient_boosting'] = gb.feature_importances_
-                features_df['GB_Importance'] = gb.feature_importances_
-            except Exception as e:
-                print(f"Warning: Gradient Boosting failed: {e}")
-                importance_methods['gradient_boosting'] = np.zeros(X.shape[1])
-                features_df['GB_Importance'] = np.zeros(X.shape[1])
-            
-            # 3. Mutual Information
-            try:
-                mi_scores = mutual_info_classif(X, target, random_state=42)
-                importance_methods['mutual_info'] = mi_scores
-                features_df['MI_Score'] = mi_scores
-            except Exception as e:
-                print(f"Warning: Mutual Information failed: {e}")
-                importance_methods['mutual_info'] = np.zeros(X.shape[1])
-                features_df['MI_Score'] = np.zeros(X.shape[1])
-            
-            # 4. ANOVA F-value
-            try:
-                f_scores, _ = f_classif(X, target)
-                # Replace inf and NaN with 0
-                f_scores = np.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
-                # Normalize to 0-1 scale
-                if np.max(f_scores) > 0:
-                    f_scores = f_scores / np.max(f_scores)
-                importance_methods['anova_f'] = f_scores
-                features_df['F_Score'] = f_scores
-            except Exception as e:
-                print(f"Warning: ANOVA F-value failed: {e}")
-                importance_methods['anova_f'] = np.zeros(X.shape[1])
-                features_df['F_Score'] = np.zeros(X.shape[1])
-            
-            # 5. Lasso feature selection with cross-validation
-            lasso_importance = np.zeros(X.shape[1])
-            
-            if X.shape[0] > 10:  # Only run if we have enough samples
+            if is_multilabel:
+                # For multi-label, calculate feature importance for each label
+                # and combine them
+                print("Calculating feature importance for each label...")
+                
+                # Initialize combined importance
+                combined_importance = np.zeros(X.shape[1])
+                
+                # Process each class separately and combine results
+                for i in range(y.shape[1]):
+                    class_y = y[:, i]
+                    
+                    # Skip classes with too few positive examples
+                    positive_count = np.sum(class_y)
+                    if positive_count < 10 or positive_count > len(class_y) - 10:
+                        continue
+                    
+                    # 1. Random Forest importance for this class
+                    try:
+                        rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+                        rf.fit(X, class_y)
+                        combined_importance += rf.feature_importances_
+                    except Exception as e:
+                        print(f"Warning: Random Forest failed for class {i}: {e}")
+                    
+                    # 2. Gradient Boosting importance for this class
+                    try:
+                        gb = GradientBoostingClassifier(n_estimators=100, random_state=42)
+                        gb.fit(X, class_y)
+                        combined_importance += gb.feature_importances_
+                    except Exception as e:
+                        print(f"Warning: Gradient Boosting failed for class {i}: {e}")
+                    
+                    # 3. Mutual Information for this class
+                    try:
+                        mi_scores = mutual_info_classif(X, class_y, random_state=42)
+                        # Normalize
+                        if np.max(mi_scores) > 0:
+                            mi_scores = mi_scores / np.max(mi_scores)
+                        combined_importance += mi_scores
+                    except Exception as e:
+                        print(f"Warning: Mutual Information failed for class {i}: {e}")
+                    
+                    # 4. ANOVA F-value for this class
+                    try:
+                        f_scores, _ = f_classif(X, class_y)
+                        # Replace inf and NaN with 0
+                        f_scores = np.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
+                        # Normalize to 0-1 scale
+                        if np.max(f_scores) > 0:
+                            f_scores = f_scores / np.max(f_scores)
+                        combined_importance += f_scores
+                    except Exception as e:
+                        print(f"Warning: ANOVA F-value failed for class {i}: {e}")
+                
+                # Normalize combined importance
+                if np.max(combined_importance) > 0:
+                    combined_importance = combined_importance / np.max(combined_importance)
+                
+                # Use the combined importance for feature ranking
+                features_df['Multi_Label_Importance'] = combined_importance
+                ensemble_importance = combined_importance
+                
+                # Also try getting an importance score via binary target as backup
+                # 1. Random Forest importance
+                rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+                rf.fit(X, binary_target)
+                importance_methods['random_forest'] = rf.feature_importances_
+                features_df['RF_Importance'] = rf.feature_importances_
+            else:
+                # For binary target, use original approach
+                # 1. Random Forest importance
+                rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+                rf.fit(X, binary_target)
+                importance_methods['random_forest'] = rf.feature_importances_
+                features_df['RF_Importance'] = rf.feature_importances_
+                
+                # 2. Gradient Boosting importance
                 try:
-                    from sklearn.linear_model import LassoCV
-                    
-                    # Normalize X for Lasso
-                    X_scaled = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
-                    X_scaled = np.nan_to_num(X_scaled)  # Replace NaNs
-                    
-                    # Run LassoCV to find optimal alpha
-                    lasso = LassoCV(cv=min(5, n_folds), random_state=42, max_iter=10000)
-                    lasso.fit(X_scaled, target)
-                    
-                    # Get coefficient importances
-                    lasso_importance = np.abs(lasso.coef_)
-                    
-                    # Normalize to 0-1 scale
-                    if np.max(lasso_importance) > 0:
-                        lasso_importance = lasso_importance / np.max(lasso_importance)
+                    gb = GradientBoostingClassifier(n_estimators=100, random_state=42)
+                    gb.fit(X, binary_target)
+                    importance_methods['gradient_boosting'] = gb.feature_importances_
+                    features_df['GB_Importance'] = gb.feature_importances_
                 except Exception as e:
-                    print(f"Warning: Lasso feature selection failed: {e}")
-                    # Fill with zeros if it fails
-                    lasso_importance = np.zeros(X.shape[1])
-            
-            importance_methods['lasso'] = lasso_importance
-            features_df['Lasso_Importance'] = lasso_importance
-            
-            # Calculate aggregated importance scores
-            ensemble_importance = np.zeros(X.shape[1])
-            
-            for method_name, importance in importance_methods.items():
-                if importance is not None:
-                    # Ensure all values are positive and normalized
-                    normalized_importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
-                    if np.max(normalized_importance) > 0:
-                        normalized_importance = normalized_importance / np.max(normalized_importance)
-                    ensemble_importance += normalized_importance
-            
-            # Normalize the ensemble importance
-            if np.max(ensemble_importance) > 0:
-                ensemble_importance = ensemble_importance / np.max(ensemble_importance)
-            
-            # Add ensemble score to DataFrame
-            features_df['Ensemble_Score'] = ensemble_importance
+                    print(f"Warning: Gradient Boosting failed: {e}")
+                    importance_methods['gradient_boosting'] = np.zeros(X.shape[1])
+                    features_df['GB_Importance'] = np.zeros(X.shape[1])
+                
+                # 3. Mutual Information
+                try:
+                    mi_scores = mutual_info_classif(X, binary_target, random_state=42)
+                    importance_methods['mutual_info'] = mi_scores
+                    features_df['MI_Score'] = mi_scores
+                except Exception as e:
+                    print(f"Warning: Mutual Information failed: {e}")
+                    importance_methods['mutual_info'] = np.zeros(X.shape[1])
+                    features_df['MI_Score'] = np.zeros(X.shape[1])
+                
+                # 4. ANOVA F-value
+                try:
+                    f_scores, _ = f_classif(X, binary_target)
+                    # Replace inf and NaN with 0
+                    f_scores = np.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
+                    # Normalize to 0-1 scale
+                    if np.max(f_scores) > 0:
+                        f_scores = f_scores / np.max(f_scores)
+                    importance_methods['anova_f'] = f_scores
+                    features_df['F_Score'] = f_scores
+                except Exception as e:
+                    print(f"Warning: ANOVA F-value failed: {e}")
+                    importance_methods['anova_f'] = np.zeros(X.shape[1])
+                    features_df['F_Score'] = np.zeros(X.shape[1])
+                
+                # 5. Lasso feature selection with cross-validation
+                lasso_importance = np.zeros(X.shape[1])
+                
+                if X.shape[0] > 10:  # Only run if we have enough samples
+                    try:
+                        from sklearn.linear_model import LassoCV
+                        
+                        # Normalize X for Lasso
+                        X_scaled = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+                        X_scaled = np.nan_to_num(X_scaled)  # Replace NaNs
+                        
+                        # Run LassoCV to find optimal alpha
+                        lasso = LassoCV(cv=min(5, n_folds), random_state=42, max_iter=10000)
+                        lasso.fit(X_scaled, binary_target)
+                        
+                        # Get coefficient importances
+                        lasso_importance = np.abs(lasso.coef_)
+                        
+                        # Normalize to 0-1 scale
+                        if np.max(lasso_importance) > 0:
+                            lasso_importance = lasso_importance / np.max(lasso_importance)
+                    except Exception as e:
+                        print(f"Warning: Lasso feature selection failed: {e}")
+                        # Fill with zeros if it fails
+                        lasso_importance = np.zeros(X.shape[1])
+                
+                importance_methods['lasso'] = lasso_importance
+                features_df['Lasso_Importance'] = lasso_importance
+                
+                # Calculate aggregated importance scores
+                ensemble_importance = np.zeros(X.shape[1])
+                
+                for method_name, importance in importance_methods.items():
+                    if importance is not None:
+                        # Ensure all values are positive and normalized
+                        normalized_importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+                        if np.max(normalized_importance) > 0:
+                            normalized_importance = normalized_importance / np.max(normalized_importance)
+                        ensemble_importance += normalized_importance
+                
+                # Normalize the ensemble importance
+                if np.max(ensemble_importance) > 0:
+                    ensemble_importance = ensemble_importance / np.max(ensemble_importance)
+                
+                # Add ensemble score to DataFrame
+                features_df['Ensemble_Score'] = ensemble_importance
             
             # Sort by ensemble importance
             feature_ranking = pd.DataFrame({
@@ -5731,11 +5856,18 @@ class ClinicalPredictionModel:
             # Default to Random Forest importance
             print(f"Using Random Forest importance...")
             
-            rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
-            rf.fit(X, target)
-            
-            # Get feature importances
-            importances = rf.feature_importances_
+            if is_multilabel:
+                # For multi-label, we'll use a MultiOutputClassifier
+                print("Using MultiOutputClassifier for multi-label feature importance...")
+                rf = MultiOutputClassifier(RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42))
+                rf.fit(X, y)
+                
+                # Get feature importances from each estimator and average them
+                importances = np.mean([estimator.feature_importances_ for estimator in rf.estimators_], axis=0)
+            else:
+                rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+                rf.fit(X, binary_target)
+                importances = rf.feature_importances_
             
             # Create a dataframe of features and importances
             feature_ranking = pd.DataFrame({
@@ -5754,12 +5886,15 @@ class ClinicalPredictionModel:
         # Split data for validation if needed
         if eval_method == 'validation':
             from sklearn.model_selection import train_test_split
-            X_train, X_val, y_train, y_val = train_test_split(X, target, test_size=0.2, random_state=42)
+            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
         
         evaluation_scores = {}
         
-        # Create a classifier for evaluation
-        eval_clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        # Create appropriate classifier for evaluation based on target type
+        if is_multilabel:
+            eval_clf = MultiOutputClassifier(RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1))
+        else:
+            eval_clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
         
         for n_feat in feature_counts:
             print(f"Evaluating with {n_feat} features...")
@@ -5773,17 +5908,46 @@ class ClinicalPredictionModel:
             
             # Evaluate using cross-validation or validation set
             if eval_method == 'cv':
-                # Use stratified k-fold cross-validation
-                cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-                cv_scores = {
-                    'accuracy': cross_val_score(eval_clf, X_selected, target, cv=cv, scoring='accuracy'),
-                    'auc': cross_val_score(eval_clf, X_selected, target, cv=cv, scoring='roc_auc'),
-                    'f1': cross_val_score(eval_clf, X_selected, target, cv=cv, scoring='f1')
-                }
-                
-                # Average scores
-                avg_scores = {metric: scores.mean() for metric, scores in cv_scores.items()}
-                std_scores = {metric: scores.std() for metric, scores in cv_scores.items()}
+                # For multi-label, we need to handle cross-validation differently
+                if is_multilabel:
+                    # Use cross_val_score with custom scoring functions
+                    from sklearn.model_selection import cross_val_predict
+                    
+                    # We'll use stratified folds based on any positive class
+                    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+                    
+                    # Get cross-validated predictions
+                    y_pred = cross_val_predict(eval_clf, X_selected, y, cv=skf)
+                    
+                    # Calculate metrics for multi-label
+                    cv_scores = {
+                        'accuracy': accuracy_score(y, y_pred),
+                        'f1_micro': f1_score(y, y_pred, average='micro'),
+                        'f1_macro': f1_score(y, y_pred, average='macro'),
+                        'f1_weighted': f1_score(y, y_pred, average='weighted')
+                    }
+                    
+                    # No standard deviation since we're calculating on the whole dataset
+                    avg_scores = cv_scores
+                    std_scores = {k: 0.0 for k in cv_scores.keys()}
+                    
+                    print(f"  Multi-label CV Results - Accuracy: {avg_scores['accuracy']:.4f}, "
+                        f"F1 Micro: {avg_scores['f1_micro']:.4f}, "
+                        f"F1 Macro: {avg_scores['f1_macro']:.4f}")
+                else:
+                    # Use stratified k-fold cross-validation
+                    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+                    cv_scores = {
+                        'accuracy': cross_val_score(eval_clf, X_selected, binary_target, cv=cv, scoring='accuracy'),
+                        'auc': cross_val_score(eval_clf, X_selected, binary_target, cv=cv, scoring='roc_auc'),
+                        'f1': cross_val_score(eval_clf, X_selected, binary_target, cv=cv, scoring='f1')
+                    }
+                    
+                    # Average scores
+                    avg_scores = {metric: scores.mean() for metric, scores in cv_scores.items()}
+                    std_scores = {metric: scores.std() for metric, scores in cv_scores.items()}
+                    
+                    print(f"  CV Results - Accuracy: {avg_scores['accuracy']:.4f}, AUC: {avg_scores['auc']:.4f}, F1: {avg_scores['f1']:.4f}")
                 
                 evaluation_scores[n_feat] = {
                     'avg_scores': avg_scores,
@@ -5791,8 +5955,6 @@ class ClinicalPredictionModel:
                     'selected_indices': selected_indices,
                     'selected_features': top_features['Feature'].tolist()
                 }
-                
-                print(f"  CV Results - Accuracy: {avg_scores['accuracy']:.4f}, AUC: {avg_scores['auc']:.4f}, F1: {avg_scores['f1']:.4f}")
                 
             else:  # validation set
                 # Train on training set
@@ -5803,34 +5965,58 @@ class ClinicalPredictionModel:
                 
                 # Predict on validation set
                 y_pred = eval_clf.predict(X_val_selected)
-                y_pred_proba = eval_clf.predict_proba(X_val_selected)[:, 1] if hasattr(eval_clf, 'predict_proba') else None
                 
                 # Calculate metrics
-                val_scores = {
-                    'accuracy': accuracy_score(y_val, y_pred),
-                    'f1': f1_score(y_val, y_pred),
-                    'precision': precision_score(y_val, y_pred),
-                    'recall': recall_score(y_val, y_pred)
-                }
-                
-                if y_pred_proba is not None:
-                    val_scores['auc'] = roc_auc_score(y_val, y_pred_proba)
+                if is_multilabel:
+                    val_scores = {
+                        'accuracy': accuracy_score(y_val, y_pred),
+                        'f1_micro': f1_score(y_val, y_pred, average='micro'),
+                        'f1_macro': f1_score(y_val, y_pred, average='macro'),
+                        'f1_weighted': f1_score(y_val, y_pred, average='weighted')
+                    }
+                    
+                    print(f"  Multi-label Val Results - Accuracy: {val_scores['accuracy']:.4f}, "
+                        f"F1 Micro: {val_scores['f1_micro']:.4f}, "
+                        f"F1 Macro: {val_scores['f1_macro']:.4f}")
+                else:
+                    val_scores = {
+                        'accuracy': accuracy_score(y_val, y_pred),
+                        'f1': f1_score(y_val, y_pred),
+                        'precision': precision_score(y_val, y_pred),
+                        'recall': recall_score(y_val, y_pred)
+                    }
+                    
+                    # For binary classification, also calculate AUC if possible
+                    if hasattr(eval_clf, 'predict_proba'):
+                        try:
+                            y_pred_proba = eval_clf.predict_proba(X_val_selected)[:, 1]
+                            val_scores['auc'] = roc_auc_score(y_val, y_pred_proba)
+                        except Exception as e:
+                            print(f"  Warning: Could not calculate AUC: {e}")
+                    
+                    print(f"  Val Results - Accuracy: {val_scores['accuracy']:.4f}, " + 
+                        (f"AUC: {val_scores['auc']:.4f}, " if 'auc' in val_scores else "") + 
+                        f"F1: {val_scores['f1']:.4f}")
                 
                 evaluation_scores[n_feat] = {
                     'val_scores': val_scores,
                     'selected_indices': selected_indices,
                     'selected_features': top_features['Feature'].tolist()
                 }
-                
-                print(f"  Val Results - Accuracy: {val_scores['accuracy']:.4f}, " + 
-                    (f"AUC: {val_scores['auc']:.4f}, " if 'auc' in val_scores else "") + 
-                    f"F1: {val_scores['f1']:.4f}")
         
-        # Step 3: Find the optimal feature count based on F1 score
-        if eval_method == 'cv':
-            f1_scores = {n_feat: scores['avg_scores']['f1'] for n_feat, scores in evaluation_scores.items()}
+        # Step 3: Find the optimal feature count based on F1 score (for binary) or F1-micro (for multi-label)
+        if is_multilabel:
+            # For multi-label, use F1-micro
+            if eval_method == 'cv':
+                f1_scores = {n_feat: scores['avg_scores']['f1_micro'] for n_feat, scores in evaluation_scores.items()}
+            else:
+                f1_scores = {n_feat: scores['val_scores']['f1_micro'] for n_feat, scores in evaluation_scores.items()}
         else:
-            f1_scores = {n_feat: scores['val_scores']['f1'] for n_feat, scores in evaluation_scores.items()}
+            # For binary, use regular F1
+            if eval_method == 'cv':
+                f1_scores = {n_feat: scores['avg_scores']['f1'] for n_feat, scores in evaluation_scores.items()}
+            else:
+                f1_scores = {n_feat: scores['val_scores']['f1'] for n_feat, scores in evaluation_scores.items()}
         
         # Find the optimal feature count (highest F1 score)
         optimal_n_features = max(f1_scores.items(), key=lambda x: x[1])[0]
@@ -5911,19 +6097,33 @@ class ClinicalPredictionModel:
             # 3. Plot all evaluation metrics for different feature counts
             plt.figure(figsize=(12, 6))
             
-            if eval_method == 'cv':
-                metrics = ['accuracy', 'auc', 'f1']
-                for metric in metrics:
-                    values = [scores['avg_scores'][metric] for n_feat, scores in evaluation_scores.items()]
-                    plt.plot(feature_counts, values, 'o-', label=metric.upper())
+            if is_multilabel:
+                # For multi-label
+                if eval_method == 'cv':
+                    metrics = ['accuracy', 'f1_micro', 'f1_macro', 'f1_weighted']
+                    for metric in metrics:
+                        values = [scores['avg_scores'][metric] for n_feat, scores in evaluation_scores.items()]
+                        plt.plot(feature_counts, values, 'o-', label=metric.upper())
+                else:
+                    metrics = ['accuracy', 'f1_micro', 'f1_macro', 'f1_weighted']
+                    for metric in metrics:
+                        values = [scores['val_scores'][metric] for n_feat, scores in evaluation_scores.items()]
+                        plt.plot(feature_counts, values, 'o-', label=metric.upper())
             else:
-                metrics = ['accuracy', 'precision', 'recall', 'f1']
-                if 'auc' in evaluation_scores[feature_counts[0]]['val_scores']:
-                    metrics.append('auc')
-                    
-                for metric in metrics:
-                    values = [scores['val_scores'][metric] for n_feat, scores in evaluation_scores.items()]
-                    plt.plot(feature_counts, values, 'o-', label=metric.upper())
+                # For binary classification
+                if eval_method == 'cv':
+                    metrics = ['accuracy', 'auc', 'f1']
+                    for metric in metrics:
+                        values = [scores['avg_scores'][metric] for n_feat, scores in evaluation_scores.items()]
+                        plt.plot(feature_counts, values, 'o-', label=metric.upper())
+                else:
+                    metrics = ['accuracy', 'precision', 'recall', 'f1']
+                    if 'auc' in evaluation_scores[feature_counts[0]]['val_scores']:
+                        metrics.append('auc')
+                        
+                    for metric in metrics:
+                        values = [scores['val_scores'][metric] for n_feat, scores in evaluation_scores.items()]
+                        plt.plot(feature_counts, values, 'o-', label=metric.upper())
             
             # Mark the optimal feature count
             plt.axvline(x=optimal_n_features, color='r', linestyle='--', 
