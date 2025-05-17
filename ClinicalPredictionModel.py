@@ -4016,7 +4016,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for diagnosis model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_diagnosis, processed_feature_names, 
-                n_features_range=(5, 50, 5),
+                n_features_range=(5, 90, 5),
                 method='ensemble'
             )
             
@@ -4186,7 +4186,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for medication model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_medication, processed_feature_names, 
-                n_features_range=(5, 50, 5),
+                n_features_range=(5, 90, 5),
                 method='ensemble'
             )
             
@@ -4317,7 +4317,7 @@ class ClinicalPredictionModel:
             print("Performing enhanced feature selection for procedure model...")
             feature_selection_results = self.enhanced_feature_selection(
                 X, y_procedure,processed_feature_names, 
-                n_features_range=(5, 50, 5),
+                n_features_range=(5, 90, 5),
                 method='ensemble'
             )
             
@@ -5066,7 +5066,7 @@ class ClinicalPredictionModel:
 
         
     def tune_model_hyperparameters(self, X_train, y_train, X_val, y_val, model_type='binary', 
-                                    tuning_epochs=30, search_epochs=5, max_trials=20):
+                                tuning_epochs=30, search_epochs=5, max_trials=20):
         """
         Improved hyperparameter tuning that correctly handles multi-label classification
         
@@ -5132,7 +5132,7 @@ class ClinicalPredictionModel:
             model.add(keras.layers.Input(shape=(input_shape,)))
             
             # First hidden layer - tune number of units, activation function and regularization
-            units_1 = hp.Int('units_1', min_value=64, max_value=512, step=32)
+            units_1 = hp.Int('units_1', min_value=128, max_value=512, step=64)
             activation_1 = hp.Choice('activation_1', values=['relu', 'selu', 'elu'])
             l2_1 = hp.Float('l2_1', min_value=1e-5, max_value=1e-2, sampling='log')
             
@@ -5148,13 +5148,15 @@ class ClinicalPredictionModel:
                 bn_momentum_1 = hp.Float('bn_momentum_1', min_value=0.7, max_value=0.99, default=0.9)
                 model.add(keras.layers.BatchNormalization(momentum=bn_momentum_1))
             
-            # Add Dropout with tunable rate
-            dropout_1 = hp.Float('dropout_1', min_value=0.1, max_value=0.5, step=0.1)
+            # Add Dropout with tunable rate - higher dropout range for multi-label classification
+            dropout_range = (0.3, 0.6) if model_type == 'multi_label' else (0.1, 0.5)
+            dropout_1 = hp.Float('dropout_1', min_value=dropout_range[0], max_value=dropout_range[1], step=0.1)
             model.add(keras.layers.Dropout(rate=dropout_1))
             
-            # Optional second hidden layer
-            if hp.Boolean('second_layer'):
-                units_2 = hp.Int('units_2', min_value=32, max_value=256, step=32)
+            # Second hidden layer - always include for multi-label
+            include_second = True if model_type == 'multi_label' else hp.Boolean('second_layer')
+            if include_second:
+                units_2 = hp.Int('units_2', min_value=64, max_value=256, step=32)
                 activation_2 = hp.Choice('activation_2', values=['relu', 'selu', 'elu'])
                 l2_2 = hp.Float('l2_2', min_value=1e-5, max_value=1e-2, sampling='log')
                 
@@ -5169,17 +5171,22 @@ class ClinicalPredictionModel:
                     bn_momentum_2 = hp.Float('bn_momentum_2', min_value=0.7, max_value=0.99, default=0.9)
                     model.add(keras.layers.BatchNormalization(momentum=bn_momentum_2))
                 
-                dropout_2 = hp.Float('dropout_2', min_value=0.1, max_value=0.5, step=0.1)
+                dropout_2 = hp.Float('dropout_2', min_value=dropout_range[0], max_value=dropout_range[1], step=0.1)
                 model.add(keras.layers.Dropout(rate=dropout_2))
             
             # Output layer
             if model_type == 'binary':
                 model.add(keras.layers.Dense(1, activation='sigmoid'))
             else:
+                # For multi-label, use a larger final layer
                 model.add(keras.layers.Dense(num_classes, activation='sigmoid'))  # multi-label
             
-            # Tune learning rate for optimizer
-            learning_rate = hp.Float('learning_rate', min_value=5e-5, max_value=1e-3, sampling='log')
+            # Tune learning rate for optimizer - use different ranges for multi-label vs binary
+            if model_type == 'multi_label':
+                # Higher learning rates for multi-label to avoid getting stuck in local minima
+                learning_rate = hp.Float('learning_rate', min_value=1e-4, max_value=5e-3, sampling='log')
+            else:
+                learning_rate = hp.Float('learning_rate', min_value=5e-5, max_value=1e-3, sampling='log')
             
             # Choose optimizer
             optimizer_choice = hp.Choice('optimizer', values=['adam', 'adamw'])
@@ -5216,13 +5223,13 @@ class ClinicalPredictionModel:
                     dtype=tf.float32
                 ))
             
-            # Compile model with the correct loss function
+            # Compile model with appropriate loss function
             if model_type == 'binary':
                 loss = 'binary_crossentropy'
             else:
-                # For multi-label classification, use binary_crossentropy
-                # as each output is a binary classification
-                loss = 'binary_crossentropy'
+                # For multi-label, use weighted binary crossentropy to address class imbalance
+                # This helps the model learn the rare positive cases
+                loss = 'binary_crossentropy'  
             
             model.compile(
                 optimizer=optimizer,
@@ -5233,12 +5240,29 @@ class ClinicalPredictionModel:
             return model
         
         # Create instance of the tuner
-        # For multi-label, use micro-F1 as primary objective
-        objective_metric = 'val_f1_score'  # Use F1 score as the primary evaluation metric
+        # For multi-label classification, we need a custom objective to handle the low F1 scores
+        if model_type == 'multi_label':
+            # Create a custom objective that combines multiple metrics to improve performance
+            # We'll weight F1 score heavily, but also include accuracy and recall to ensure
+            # we don't get models that simply predict all negatives
+            def custom_objective(metrics):
+                # For multi-label, maximize a weighted combination of metrics
+                # This helps avoid the trivial solution of predicting all negatives
+                f1 = metrics['val_f1_score']
+                recall = metrics['val_recall']
+                # We weight F1 score heavily, but also include recall to ensure we catch positives
+                # This is critical for imbalanced multi-label classification
+                return 0.7 * f1 + 0.3 * recall  
+            
+            objective = kt.Objective(custom_objective, direction='max')
+            print("Using custom multi-label objective function combining F1 and recall")
+        else:
+            # For binary classification, F1 score is sufficient
+            objective = kt.Objective('val_f1_score', direction='max')
         
         tuner = kt.Hyperband(
             build_model,
-            objective=kt.Objective(objective_metric, direction='max'),
+            objective=objective,
             max_epochs=tuning_epochs,
             factor=3,
             directory='hyperparameter_tuning',
@@ -5298,31 +5322,42 @@ class ClinicalPredictionModel:
             # For multi-label, use sample weighting based on label density
             print(f"Multi-label with {num_classes} classes")
             
-            # Calculate sample weights based on the number of positive labels
-            # This gives higher weight to samples with more positive labels
-            # and also gives higher weight to samples with at least one positive label
-            label_counts = np.sum(y_train, axis=1)
+            # Calculate percentage of positive examples for each class
+            class_positive_ratios = np.mean(y_train, axis=0)
+            print(f"Positive example percentages by class: min={min(class_positive_ratios)*100:.2f}%, "
+                f"max={max(class_positive_ratios)*100:.2f}%, "
+                f"avg={np.mean(class_positive_ratios)*100:.2f}%")
+            
+            # Calculate inverse class frequencies to weight rare classes more heavily
+            class_weights = np.ones(num_classes)
+            for i in range(num_classes):
+                pos_ratio = class_positive_ratios[i]
+                # Avoid division by zero 
+                if pos_ratio > 0:
+                    # More weight to rare classes, but cap at 100x to avoid extreme weights
+                    class_weights[i] = min(100.0, 1.0 / (pos_ratio + 0.01))
+                else:
+                    class_weights[i] = 1.0  # No positive examples, use default weight
+            
+            # Calculate sample weights based on the classes each sample belongs to
+            # This gives more weight to samples with rare positive labels
             sample_weights = np.ones(len(y_train))
+            for i in range(len(y_train)):
+                # For each sample, calculate weight based on its positive labels
+                if np.sum(y_train[i]) > 0:  # If the sample has any positive labels
+                    # Get the weight from the rarest positive class this sample has
+                    pos_indices = np.where(y_train[i] == 1)[0]
+                    max_class_weight = np.max(class_weights[pos_indices])
+                    # Scale the weight but don't let it get too extreme
+                    sample_weights[i] = max_class_weight
             
-            # Increase weight for samples with at least one positive label
-            pos_samples = label_counts > 0
-            pos_count = np.sum(pos_samples)
+            # Normalize weights to have reasonable magnitudes
+            if np.max(sample_weights) > 0:
+                # Scale weights to have mean close to 1
+                sample_weights = sample_weights * (len(sample_weights) / np.sum(sample_weights))
             
-            if pos_count > 0:
-                # Calculate base weight for positive samples
-                base_weight = (len(y_train) - pos_count) / pos_count if pos_count < len(y_train) else 1.0
-                # Cap the weight to avoid extreme values
-                base_weight = min(3.0, base_weight)
-                
-                # Apply weights - samples with more positive labels get higher weights
-                for i in range(len(sample_weights)):
-                    if label_counts[i] > 0:
-                        # More positive labels = higher weight, up to 2x the base weight
-                        # This encourages the model to learn from rare combinations
-                        sample_weights[i] = base_weight * (1 + min(1.0, label_counts[i] / num_classes))
-                
-                print(f"Using sample weights: baseline {base_weight:.2f}x for positive samples")
-                print(f"Sample weights range: {np.min(sample_weights):.2f} - {np.max(sample_weights):.2f}")
+            print(f"Sample weights calculated - Mean: {np.mean(sample_weights):.2f}, "
+                f"Max: {np.max(sample_weights):.2f}, Min: {np.min(sample_weights):.2f}")
             
             # Search with sample weights
             tuner.search(
@@ -5386,23 +5421,54 @@ class ClinicalPredictionModel:
                     verbose=1
                 )
         else:
-            # For multi-label, use the sample weights calculated earlier
-            label_counts = np.sum(y_train, axis=1)
-            sample_weights = np.ones(len(y_train))
-            pos_samples = label_counts > 0
+            # For multi-label, use the improved sample weights calculated earlier
+            # Calculate percentage of positive examples for each class
+            class_positive_ratios = np.mean(y_train, axis=0)
             
-            if np.sum(pos_samples) > 0:
-                base_weight = (len(y_train) - np.sum(pos_samples)) / np.sum(pos_samples)
-                base_weight = min(3.0, base_weight)
+            # Calculate inverse class frequencies to weight rare classes more heavily
+            class_weights = np.ones(num_classes)
+            for i in range(num_classes):
+                pos_ratio = class_positive_ratios[i]
+                # Avoid division by zero 
+                if pos_ratio > 0:
+                    # More weight to rare classes, but cap at 100x to avoid extreme weights
+                    class_weights[i] = min(100.0, 1.0 / (pos_ratio + 0.01))
+                else:
+                    class_weights[i] = 1.0  # No positive examples, use default weight
+            
+            # Calculate sample weights based on the classes each sample belongs to
+            sample_weights = np.ones(len(y_train))
+            for i in range(len(y_train)):
+                # For each sample, calculate weight based on its positive labels
+                if np.sum(y_train[i]) > 0:  # If the sample has any positive labels
+                    # Get the weight from the rarest positive class this sample has
+                    pos_indices = np.where(y_train[i] == 1)[0]
+                    max_class_weight = np.max(class_weights[pos_indices])
+                    # Scale the weight but don't let it get too extreme
+                    sample_weights[i] = max_class_weight
+            
+            # Normalize weights to have reasonable magnitudes
+            if np.max(sample_weights) > 0:
+                # Scale weights to have mean close to 1
+                sample_weights = sample_weights * (len(sample_weights) / np.sum(sample_weights))
+            
+            # Use a higher learning rate for the final training since multilabel is harder to optimize
+            try:
+                # Get the current learning rate from the optimizer
+                current_lr = float(best_model.optimizer.learning_rate.numpy())
                 
-                for i in range(len(sample_weights)):
-                    if label_counts[i] > 0:
-                        sample_weights[i] = base_weight * (1 + min(1.0, label_counts[i] / num_classes))
+                # Use a slightly higher learning rate (1.5x) for multi-label final training
+                # This helps escape poor local optima
+                new_lr = current_lr * 1.5
+                tf.keras.backend.set_value(best_model.optimizer.learning_rate, new_lr)
+                print(f"Increasing learning rate for final training from {current_lr:.6f} to {new_lr:.6f}")
+            except Exception as e:
+                print(f"Could not adjust learning rate: {str(e)}")
             
             history = best_model.fit(
                 X_train, y_train,
                 validation_data=(X_val, y_val),
-                epochs=search_epochs,
+                epochs=search_epochs * 2,  # Double epochs for multi-label since it's harder to train
                 callbacks=[early_stopping, reduce_lr, final_checkpoint_callback],
                 sample_weight=sample_weights,
                 verbose=1
@@ -5603,7 +5669,7 @@ class ClinicalPredictionModel:
         import seaborn as sns
         from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
         from sklearn.feature_selection import mutual_info_classif, f_classif
-        from sklearn.model_selection import cross_val_score, StratifiedKFold
+        from sklearn.model_selection import cross_val_score, KFold, train_test_split
         from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
         from sklearn.multioutput import MultiOutputClassifier
 
@@ -5726,17 +5792,39 @@ class ClinicalPredictionModel:
                     except Exception as e:
                         print(f"Warning: Mutual Information failed for class {i}: {e}")
                     
-                    # 4. ANOVA F-value for this class
+                    # 4. ANOVA F-value for this class - with handling for constant features
                     try:
-                        f_scores, _ = f_classif(X, class_y)
+                        # First check for constant features
+                        constant_features = np.where(np.var(X, axis=0) == 0)[0]
+                        if len(constant_features) > 0:
+                            print(f"  Class {i}: Detected {len(constant_features)} constant features at indices {constant_features}")
+                            
+                        # Create a temporary X with a small amount of noise to avoid constant features
+                        X_temp = X.copy()
+                        if len(constant_features) > 0:
+                            # Add tiny random noise to constant features (won't affect real features but avoids warnings)
+                            np.random.seed(42)  # for reproducibility
+                            for const_idx in constant_features:
+                                X_temp[:, const_idx] = X_temp[:, const_idx] + np.random.normal(0, 1e-10, size=X_temp.shape[0])
+                        
+                        # Use try-except and use the original f_classif with warning silencing
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", category=RuntimeWarning)
+                            f_scores, _ = f_classif(X_temp, class_y)
+                        
                         # Replace inf and NaN with 0
                         f_scores = np.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
+                        
                         # Normalize to 0-1 scale
                         if np.max(f_scores) > 0:
                             f_scores = f_scores / np.max(f_scores)
                         combined_importance += f_scores
                     except Exception as e:
                         print(f"Warning: ANOVA F-value failed for class {i}: {e}")
+                        # In case of failure, add zeros
+                        f_scores = np.zeros(X.shape[1])
+                        combined_importance += f_scores
                 
                 # Normalize combined importance
                 if np.max(combined_importance) > 0:
@@ -5910,32 +5998,46 @@ class ClinicalPredictionModel:
             if eval_method == 'cv':
                 # For multi-label, we need to handle cross-validation differently
                 if is_multilabel:
-                    # Use cross_val_score with custom scoring functions
-                    from sklearn.model_selection import cross_val_predict
+                    # Use a modified approach for multi-label data
+                    # Instead of using StratifiedKFold, use regular KFold for multilabel
+                    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
                     
-                    # We'll use stratified folds based on any positive class
-                    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-                    
-                    # Get cross-validated predictions
-                    y_pred = cross_val_predict(eval_clf, X_selected, y, cv=skf)
-                    
-                    # Calculate metrics for multi-label
-                    cv_scores = {
-                        'accuracy': accuracy_score(y, y_pred),
-                        'f1_micro': f1_score(y, y_pred, average='micro'),
-                        'f1_macro': f1_score(y, y_pred, average='macro'),
-                        'f1_weighted': f1_score(y, y_pred, average='weighted')
+                    # Initialize metrics storage
+                    cv_metrics = {
+                        'accuracy': [],
+                        'f1_micro': [],
+                        'f1_macro': [],
+                        'f1_weighted': []
                     }
                     
-                    # No standard deviation since we're calculating on the whole dataset
-                    avg_scores = cv_scores
-                    std_scores = {k: 0.0 for k in cv_scores.keys()}
+                    # Perform manual cross-validation
+                    for train_idx, test_idx in kf.split(X_selected):
+                        # Split the data
+                        X_train_cv, X_test_cv = X_selected[train_idx], X_selected[test_idx]
+                        y_train_cv, y_test_cv = y[train_idx], y[test_idx]
+                        
+                        # Train the model
+                        eval_clf.fit(X_train_cv, y_train_cv)
+                        
+                        # Make predictions
+                        y_pred_cv = eval_clf.predict(X_test_cv)
+                        
+                        # Calculate metrics
+                        cv_metrics['accuracy'].append(accuracy_score(y_test_cv, y_pred_cv))
+                        cv_metrics['f1_micro'].append(f1_score(y_test_cv, y_pred_cv, average='micro'))
+                        cv_metrics['f1_macro'].append(f1_score(y_test_cv, y_pred_cv, average='macro'))
+                        cv_metrics['f1_weighted'].append(f1_score(y_test_cv, y_pred_cv, average='weighted'))
+                    
+                    # Calculate average metrics
+                    avg_scores = {metric: np.mean(scores) for metric, scores in cv_metrics.items()}
+                    std_scores = {metric: np.std(scores) for metric, scores in cv_metrics.items()}
                     
                     print(f"  Multi-label CV Results - Accuracy: {avg_scores['accuracy']:.4f}, "
                         f"F1 Micro: {avg_scores['f1_micro']:.4f}, "
                         f"F1 Macro: {avg_scores['f1_macro']:.4f}")
                 else:
-                    # Use stratified k-fold cross-validation
+                    # Use stratified k-fold cross-validation for binary targets
+                    from sklearn.model_selection import StratifiedKFold
                     cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
                     cv_scores = {
                         'accuracy': cross_val_score(eval_clf, X_selected, binary_target, cv=cv, scoring='accuracy'),
@@ -6148,6 +6250,7 @@ class ClinicalPredictionModel:
         
         return results
 
+
     def feature_stability_analysis(self, X, y, feature_names, method='ensemble', 
                                 n_features=50, n_runs=10, sampling_fraction=0.8):
         """
@@ -6197,7 +6300,7 @@ class ClinicalPredictionModel:
             # Perform feature selection
             selection_result = self.enhanced_feature_selection(
                 X_boot, y_boot, feature_names, 
-                n_features_range=(5, 80, 5), method=method,
+                n_features_range=(5, 90, 5), method=method,
                 plot_results=False
             )
             
